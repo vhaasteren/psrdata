@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: black --check src tests
+      - run: ruff check src tests
+      # Runs with numpy and pyarrow only, which is the point: the import test
+      # would pass vacuously in an environment that had the timing stack.
+      - run: pytest -q -m "not consumers"
+
+  consumers:
+    # The schema's real gate: the files this package writes must be readable by
+    # the stock readers of the two packages that consume them, with no adapter.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: |
+          pip install 'enterprise-pulsar @ git+https://github.com/nanograv/enterprise'
+          pip install 'python-discovery @ git+https://github.com/nanograv/discovery'
+      - run: pytest -q -m consumers

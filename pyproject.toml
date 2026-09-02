@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psrdata"
+description = "The frozen pulsar-data record, its feather schema, and the pure par-text rules"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Rutger van Haasteren" }]
+dynamic = ["version"]
+
+# Deliberately two. This package sits *below* every timing package and every
+# likelihood, so it must not import PINT, tempo2, JAX or astropy -- a frozen
+# array record that required a timing engine to read would defeat its purpose.
+# A test asserts the import graph.
+dependencies = ["numpy>=1.24", "pyarrow>=12"]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["consumers: needs discovery and/or enterprise installed"]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

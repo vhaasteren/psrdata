@@ -1,0 +1,46 @@
+# psrdata
+
+**The frozen pulsar-data record, its on-disk schema, and the pure par-text
+rules** — the layer every pulsar-timing package in this stack agrees on, and
+the only one none of them owns.
+
+```python
+from psrdata import PulsarData
+
+psr = PulsarData.from_feather("J1909-3744.feather")
+psr.toas, psr.residuals, psr.Mmat, psr.fitpars   # named, frozen, in the writer's row order
+```
+
+## What it is
+
+Two things, both of which were being duplicated:
+
+1. **`PulsarData`** — a frozen record of named arrays (TOAs, residuals, design
+   matrix, flags, ephemeris vectors) plus the metadata that makes it
+   self-describing: which software wrote it, which timing package read the
+   files, the exact reference parameter values, the units, the gauge
+   provenance. `feather.write`/`read` are its on-disk form, schema
+   `pulsardata-feather-v1`, whose columns are exactly what Enterprise's
+   `FeatherPulsar` and Discovery's `Pulsar` already read.
+2. **`partext`** — the par-file rules that are pure text: which lines are
+   noise hyperparameters, what `UNITS` means, the two keyword respellings PINT
+   and tempo2 disagree about, and collapsing a doubled non-repeatable line.
+
+## What it is not
+
+It does not know about engines, PINT, tempo2, JAX, or sorting. Its runtime
+dependencies are `numpy` and `pyarrow`, and a test asserts that importing it
+pulls in nothing else — that is the property that lets it sit below everything.
+
+**It never reorders rows.** Row `i` of every array is row `i` as the writer
+emitted it. A consumer that wants time order sorts when it reads; a timing
+package that permutes the rows its residual and design matrix are built from
+publishes two orders for one freeze, and the reconciling permutation is the
+identity on most real files and therefore never exercised.
+
+## Who produces it
+
+`vela-jax` (one record per pulsar, from its own engine), `MetaPulsar` (one
+record per multi-PTA composite), and in time any other timing package. `nltiming`
+consumes it: `LinearTimingEngine.from_feather` rebuilds a frozen linear timing
+analysis from the file alone, with no timing package installed.
