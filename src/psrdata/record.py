@@ -14,6 +14,11 @@ It lives here rather than in a timing package because a frozen array record
 must not require a JAX engine to exist, and rather than in a protocol package
 because protocols are not products. Its dependencies are numpy and pyarrow.
 
+The record is also its own linear engine: :meth:`PulsarData.linear_engine`
+returns ``Δr = −Mmat δ`` in the shape nltiming's ``TimingEngine`` protocol
+describes (:mod:`psrdata.linear`), so a frozen linear timing analysis needs
+this file and nothing else -- no timing package, no inference package.
+
 **Row order is the writer's, and this package never changes it.** Row ``i`` of
 every array is row ``i`` as the producing timing package emitted it. A consumer
 that wants time order sorts on read: Enterprise already does, at its own
@@ -28,13 +33,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
 import numpy as np
+
+from .gauge import GaugeProvenance, coerce_gauge
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .linear import LinearTimingEngine
 
 #: On-disk schema name and version. The columns are exactly the ones
 #: Enterprise's ``FeatherPulsar`` and Discovery's ``Pulsar`` already read; the
 #: metadata block is additive, so a reader that predates it ignores it.
+#:
+#: Wideband (schema still v1 until a producer emits it). A wideband TOA is one
+#: row with a second measurement, not a second row: PINT forbids mixing
+#: narrowband and wideband in one ``TOAs`` object, and Vela.jl's
+#: ``WidebandTOA`` is a TOA plus ``DMInfo(value, error)``. Enterprise's
+#: ``WidebandTimingModel`` already reads ``flags["pp_dm"]`` / ``flags["pp_dme"]``
+#: and ``dmx`` from this record — those flags can land in :attr:`flags` with
+#: no schema bump. A PINT/Vela residual engine needs the DM residual and its
+#: error as arrays (``dm_residuals``, ``dmerrs``, and a DM design matrix or a
+#: stacked ``(2N, n_fit)`` ``Mmat``); that is a new schema version, because
+#: old readers would otherwise treat ``Mmat`` as TOA-only. Keep ``DMJUMP`` on
+#: the par (it is a DM delay). Drop ``DMEFAC``/``DMEQUAD`` from
+#: :data:`psrdata.partext.NOISE_NAMES` once that ingest exists — they scale
+#: the DM error the way EFAC/EQUAD scale the TOA error. pyvela refuses ECORR
+#: on wideband.
 SCHEMA = "pulsardata-feather-v1"
 
 #: Enterprise planet slots: Mercury=0 ... Pluto=8.
@@ -136,13 +161,16 @@ class PulsarData:
     dm: float
     dmx: dict | None
     state_id: str
-    #: Which package wrote this record: ``"vela_jax"``, ``"metapulsar"``, ...
+    #: Which package wrote this record: ``"metapulsar"``, ...
     software: str
     #: Which timing package read the files: ``"pint"``, ``"tempo2"``, or
     #: ``"composite"`` for a record combining legs read by different ones.
     timing_package: str
-    #: One gauge-provenance dict, or ``{leg: dict}`` for a composite.
-    gauge: Mapping[str, Any]
+    #: One :class:`~psrdata.gauge.GaugeProvenance`, or ``{leg: provenance}``
+    #: for a composite. A plain mapping of the field names is accepted and
+    #: validated on construction, which is also what the feather reader hands
+    #: in.
+    gauge: GaugeProvenance | Mapping[str, GaugeProvenance]
     reference_theta_exact: Mapping[str, str]
     native_units: Mapping[str, str]
     #: Additive metadata a producer wants to carry (a composite's ``legs``,
@@ -181,6 +209,11 @@ class PulsarData:
         missing = [f for f in self.fitpars if f not in self.reference_theta_exact]
         if missing:
             raise ValueError(f"reference_theta_exact is missing fitpars {missing}")
+        object.__setattr__(
+            self,
+            "gauge",
+            coerce_gauge(self.gauge, composite=self.timing_package == "composite"),
+        )
 
         for f in fields(self):
             value = getattr(self, f.name)
@@ -205,6 +238,15 @@ class PulsarData:
     def toa_rows(self) -> TOARows:
         """The three columns that identify a row."""
         return TOARows(self.stoas, self.freqs, self.toaerrs)
+
+    def linear_engine(self) -> "LinearTimingEngine":
+        """This record as its own linear engine, ``Δr = −Mmat δ``.
+
+        Single-leg or composite; see :func:`psrdata.linear.linear_engine`.
+        """
+        from .linear import linear_engine
+
+        return linear_engine(self)
 
     def to_feather(self, path, *, noisedict=None) -> Path:
         from .feather import write

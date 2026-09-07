@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from .gauge import gauge_to_json
 from .record import SCHEMA, PulsarData
 
 _COLUMNS = (
@@ -71,7 +72,7 @@ def write(record: PulsarData, path, *, noisedict=None) -> Path:
         "state_id": record.state_id,
         "software": record.software,
         "timing_package": record.timing_package,
-        "gauge": dict(record.gauge or {}),
+        "gauge": gauge_to_json(record.gauge),
         "reference_theta_exact": dict(record.reference_theta_exact or {}),
         "native_units": dict(record.native_units or {}),
         "extra": dict(record.extra or {}),

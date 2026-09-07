@@ -32,6 +32,8 @@ def test_round_trip_is_lossless(written):
             assert set(mine) == set(theirs)
             for key, values in mine.items():
                 assert np.array_equal(np.asarray(values).astype(str), theirs[key])
+        elif dataclasses.is_dataclass(mine):
+            assert mine == theirs, f.name
         else:
             same = type(mine)(theirs) == mine if mine is not None else theirs is None
             assert same, f.name

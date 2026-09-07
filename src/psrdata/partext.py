@@ -5,11 +5,11 @@ one line), with no subprocess, no PINT, no alias table and no physics. That is
 the boundary: the moment a rule needs to know what a parameter *means* it
 belongs to a timing package, not here.
 
-These rules were duplicated across MetaPulsar and vela-jax, which is how the
-two noise classifiers came to disagree — MetaPulsar's caught ``TNEFAC`` and
-missed ``TRES``; vela-jax's the reverse — while a cross-repo byte-identity test
-asserted they were the same. :func:`is_noise_line` below is the union, and the
-union is now the only copy.
+These rules were duplicated across timing packages, which is how two noise
+classifiers came to disagree — one caught ``TNEFAC`` and missed ``TRES``; the
+other the reverse — while a cross-repo byte-identity test asserted they were
+the same. :func:`is_noise_line` below is the union, and the union is now the
+only copy.
 """
 
 from __future__ import annotations
@@ -52,60 +52,60 @@ def line_key(line: str) -> str:
 
 # --- noise lines -----------------------------------------------------------
 
-#: The union of MetaPulsar's ``NOISE_PAR_KEYS`` and vela-jax's
-#: ``freeze.NOISE_NAMES``. Neither alone is right: MetaPulsar's spells the
-#: tempo2 EFAC family ``TNEFAC``/``TNEQUAD`` and would leave vela-jax's
-#: ``TNEF``/``TNEQ``, ``TRES``, ``DMRES`` in a stripped par; vela-jax's is the
-#: mirror image. Combining them is safe because every key here names a
-#: white/red-noise hyperparameter, and none of them is a delay column on a
-#: narrowband path.
+#: Exact first-token identity, upper-cased. No prefix catch-alls: those are
+#: how a delay keyword gets stripped by accident.
 #:
-#: ``DMJUMP``/``DMEFAC``/``DMEQUAD`` apply only to wideband DM *measurements*.
-#: They stay in the set so a stripped par drops them the same way until a
-#: wideband path exists.
+#: The names that actually matter to a residual ingest are the white-noise
+#: scalings (``EFAC``/``EQUAD`` and their tempo2/PINT aliases) and ``ECORR``
+#: (Vela.jl uses it to decide whether to reorder TOAs). Everything else on
+#: this list — power-law hyperparameters, fit-summary lines (``TRES``,
+#: ``CHI2``), wideband DM-error scalings (``DMEFAC``/``DMEQUAD``) — is inert
+#: in a delay-only engine, but is still stripped so the packages that ingest
+#: these objects do not have to ignore them.
+#:
+#: Wideband (when a producer starts emitting it): stop stripping
+#: ``DMEFAC``/``DMEQUAD`` — they are PINT ``ScaleDmError`` / Vela.jl
+#: ``DispersionMeasurementNoise``, the DM analogue of EFAC/EQUAD. Keep
+#: ``DMJUMP``. PINT forbids mixing narrowband and wideband TOAs in one
+#: object; Vela.jl's ``WidebandTOA`` carries ``DMInfo(value, error)`` beside
+#: the TOA and ``form_residual`` returns ``(tres, dmres)``. ECORR is refused
+#: on wideband in pyvela. See :class:`~psrdata.record.PulsarData` for the
+#: array-side of that bump (``flags["pp_dm"]``/``pp_dme`` already satisfy
+#: Enterprise's ``WidebandTimingModel``).
 # fmt: off
 NOISE_NAMES = frozenset({
-    "EFAC", "TNEFAC", "T2EFAC", "EQUAD", "TNEQUAD", "T2EQUAD",
-    "ECORR", "TNECORR", "DMEFAC", "DMEQUAD", "DMJUMP",
+    # white-noise scaling (PINT ScaleToaError + tempo2 spellings)
+    "EFAC", "T2EFAC", "TNEF", "TNEFAC",
+    "EQUAD", "T2EQUAD", "TNEQ", "TNEQUAD",
+    "TNGLOBALEF", "TNGLOBALEQ",
+    # ECORR: Vela.jl sorts TOAs when this is present (narrowband only)
+    "ECORR", "TNECORR",
+    # wideband DM-error scaling (PINT ScaleDmError)
+    "DMEFAC", "DMEQUAD",
+    # power-law red / DM / chromatic / solar-wind (inert for residuals)
     "RNAMP", "RNIDX",
     "TNREDAMP", "TNREDGAM", "TNREDC", "TNREDF", "TNREDFC",
-    "TNDMAMP", "TNDMGAM",
-    "TNCHROMAMP", "TNCHROMGAM", "TNCHROMIDX",
+    "TNREDFLOG", "TNREDFLOG_FACTOR", "TNREDTSPAN",
+    "TNDMAMP", "TNDMGAM", "TNDMC", "TNDMFLOG", "TNDMFLOG_FACTOR", "TNDMTSPAN",
+    "TNCHROMAMP", "TNCHROMGAM", "TNCHROMC", "TNCHROMIDX",
+    "TNCHROMFLOG", "TNCHROMFLOG_FACTOR", "TNCHROMTSPAN",
+    "TNSWAMP", "TNSWGAM", "TNSWC", "TNSWFLOG", "TNSWFLOG_FACTOR",
     "TNGAMMA", "TNAMP",
-    "TNEF", "TNEQ", "TNGLOBALEF", "TNGLOBALEQ", "TRES", "DMRES",
+    "PLREDFREQ", "PLREDAMP",
+    # fit summaries (PINT TimingModel; Vela.jl ignores them)
+    "TRES", "DMRES", "CHI2", "CHI2R",
 })
-NOISE_PREFIXES = (
-    "EFAC", "EQUAD", "ECORR", "T2EFAC", "T2EQUAD", "TNEFAC", "TNEQUAD",
-    "DMEFAC", "DMEQUAD", "DMJUMP",
-    "TNRED", "TNDM", "TNCHROM", "TNSW", "PLRED", "PLDM", "PLCHROM", "CHI2",
-)
 # fmt: on
-
-#: Timing keywords that begin ``TN``/``RN`` and are *not* noise. Without these
-#: the catch-alls below would strip a par's phase connection (``TRACK``), its
-#: TT->TDB ephemeris (``TIMEEPH``), its celestial-frame method (``T2CMETHOD``)
-#: or its right ascension (``RA``/``RAJ``).
-_TN_EXCEPTIONS = frozenset({"TRACK", "TIMEEPH", "T2CMETHOD"})
-_RN_EXCEPTIONS = frozenset({"RA", "RAJ"})
 
 
 def is_noise_line(line: str) -> bool:
-    """True when ``line`` is a white/red-noise hyperparameter, not a delay.
+    """True when the line's first token is in :data:`NOISE_NAMES`.
 
-    Comments and blanks are not noise. The ``TN*`` / ``RN*`` catch-alls exist
-    because tempo2's noise vocabulary is open-ended; the exception sets above
-    are what keeps them from swallowing timing keywords.
+    Comments and blanks are not noise. Matching is exact, not a prefix.
     """
     if not is_active_line(line):
         return False
-    key = line_key(line)
-    if key in NOISE_NAMES:
-        return True
-    if key.startswith("TN") and key not in _TN_EXCEPTIONS:
-        return True
-    if key.startswith("RN") and key not in _RN_EXCEPTIONS:
-        return True
-    return any(key.startswith(prefix) for prefix in NOISE_PREFIXES)
+    return line_key(line) in NOISE_NAMES
 
 
 def strip_noise_lines(text: str) -> str:
@@ -241,7 +241,6 @@ def dedupe_nonrepeatable(text: str) -> str:
 __all__ = [
     "TIMESCALES",
     "NOISE_NAMES",
-    "NOISE_PREFIXES",
     "REPEATABLE_KEYS",
     "is_active_line",
     "active_lines",

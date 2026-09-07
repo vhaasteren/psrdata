@@ -27,27 +27,24 @@ from psrdata.partext import (
         "TNDMGam 2.0",
         "PLREDFREQ 1.0",
         "RNAMP 1e-14",
-        "DMJUMP -fe Rcvr 1e-3",
         "CHI2 1234.5",
-        # MetaPulsar's classifier caught these and vela-jax's did not
+        # tempo2 EFAC family (TNEFAC/TNEQUAD)
         "TNEFAC -f L 1.0",
         "TNEQUAD -f L 0.1",
-        # vela-jax's caught these and MetaPulsar's did not
+        # TNEF/TNEQ/TRES/DMRES family
         "TRES 1.04",
         "DMRES 0.5",
         "TNEF -f L 1.0",
         "TNEQ -f L -6.0",
         "TNSWAMP -12.0",
         "PLREDAMP -13.0",
+        "CHI2R 1.2",
+        "TNREDFLOG 2",
+        "TNDMC 30",
     ],
 )
-def test_the_union_classifier_catches_both_vocabularies(line):
-    """Neither original classifier was right on its own.
-
-    MetaPulsar's spelled the tempo2 EFAC family ``TNEFAC``/``TNEQUAD`` and
-    would have left ``TNEF``/``TRES`` in a stripped par; vela-jax's was the
-    mirror image. A cross-repo byte-identity test asserted they agreed.
-    """
+def test_the_explicit_list_catches_both_vocabularies(line):
+    """Exact first-token match against :data:`NOISE_NAMES`, no prefix net."""
     assert is_noise_line(line)
 
 
@@ -56,16 +53,19 @@ def test_the_union_classifier_catches_both_vocabularies(line):
     [
         "F0 61.485476554371304592 1 1.7e-11",
         "JUMP -fe Rcvr_800 0.1 1",
+        "DMJUMP -fe Rcvr 1e-3",
         "DM 160.0 1",
         "ELAT 5.0 1",
         "FD1 0.001 1",
         "TZRMJD 55000.0",
-        # the TN*/RN* catch-alls must not swallow these
         "TRACK -2",
         "TIMEEPH FB90",
         "T2CMETHOD IAU2000B",
         "RAJ 18:53:57.3",
         "RA 18:53:57.3",
+        # not on the list: a prefix catch-all would have taken these
+        "PLREDSIN_0001 1e-7",
+        "TNUNKNOWN 1.0",
     ],
 )
 def test_timing_keywords_survive(line):

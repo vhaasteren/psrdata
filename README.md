@@ -1,19 +1,23 @@
 # psrdata
 
-**The frozen pulsar-data record, its on-disk schema, and the pure par-text
-rules** — the layer every pulsar-timing package in this stack agrees on, and
-the only one none of them owns.
+**The frozen pulsar-data record, its on-disk schema, its own linear engine,
+and the pure par-text rules** — the layer every pulsar-timing package in this
+stack agrees on, and the only one none of them owns.
 
 ```python
 from psrdata import PulsarData
 
 psr = PulsarData.from_feather("J1909-3744.feather")
 psr.toas, psr.residuals, psr.Mmat, psr.fitpars   # named, frozen, in the writer's row order
+engine = psr.linear_engine()                     # Δr = −Mmat δ, in nltiming's engine shape
 ```
+
+[`SPEC.md`](SPEC.md) is the normative description; [`SPEC-motivation.md`](SPEC-motivation.md)
+says why it is designed the way it is.
 
 ## What it is
 
-Two things, both of which were being duplicated:
+Four things, each of which was being duplicated or defined one layer too high:
 
 1. **`PulsarData`** — a frozen record of named arrays (TOAs, residuals, design
    matrix, flags, ephemeris vectors) plus the metadata that makes it
@@ -22,15 +26,25 @@ Two things, both of which were being duplicated:
    provenance. `feather.write`/`read` are its on-disk form, schema
    `pulsardata-feather-v1`, whose columns are exactly what Enterprise's
    `FeatherPulsar` and Discovery's `Pulsar` already read.
-2. **`partext`** — the par-file rules that are pure text: which lines are
+2. **The record's linear engine** — `PulsarData.linear_engine()` returns
+   `Δr = −Mmat δ` over the record's own matrix, single-leg or composite, in
+   the shape nltiming's `TimingEngine` protocol describes, without importing
+   nltiming. A composite declares no partition: a leg's rows are the support
+   of its named gauge column, and the parameters it owns are the columns
+   nonzero on those rows.
+3. **`GaugeProvenance`** — the validated type of the `gauge` field, here
+   because it is serialized in the record. nltiming re-exports it.
+4. **`partext`** — the par-file rules that are pure text: which lines are
    noise hyperparameters, what `UNITS` means, the two keyword respellings PINT
    and tempo2 disagree about, and collapsing a doubled non-repeatable line.
 
 ## What it is not
 
-It does not know about engines, PINT, tempo2, JAX, or sorting. Its runtime
+It does not know about PINT, tempo2, JAX, or sorting, and it defines no
+protocol for a live function of the timing parameters. Its runtime
 dependencies are `numpy` and `pyarrow`, and a test asserts that importing it
-pulls in nothing else — that is the property that lets it sit below everything.
+pulls in nothing else — that is the property that lets it sit below everything,
+and what lets a frozen linear timing analysis run from the file alone.
 
 **It never reorders rows.** Row `i` of every array is row `i` as the writer
 emitted it. A consumer that wants time order sorts when it reads; a timing
@@ -40,7 +54,8 @@ identity on most real files and therefore never exercised.
 
 ## Who produces it
 
-`vela-jax` (one record per pulsar, from its own engine), `MetaPulsar` (one
-record per multi-PTA composite), and in time any other timing package. `nltiming`
-consumes it: `LinearTimingEngine.from_feather` rebuilds a frozen linear timing
-analysis from the file alone, with no timing package installed.
+`MetaPulsar` (one record per multi-PTA composite), `vela-jax` (one per pulsar)
+and any other timing package that emits the record. Enterprise and Discovery
+read the feather with their own readers and never import this package.
+`nltiming` consumes the record and its linear engine, and re-exports
+`LinearTimingEngine`, `LinearModel` and `GaugeProvenance` from here.
