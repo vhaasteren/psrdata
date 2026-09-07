@@ -1,257 +1,449 @@
-"""The pulsar: one frozen record of named arrays.
+"""The ``PulsarData`` record and its value types (SPEC §3, §4).
 
-:class:`PulsarData` is simultaneously three things, with no adapter code
-between them:
+A record is the result of one materialized timing calculation at one
+reference model: row arrays, residuals, design matrix and the facts needed to
+interpret them. psrdata validates what it can observe structurally (§3.2,
+R-4.1.1) and never reorders rows (R-1.4). What the values *mean* is the
+producer's obligation (§9).
 
-* nltiming's ``protocols.PulsarData`` plus its ephemeris extras, satisfied
-  structurally;
-* an Enterprise pulsar in the ``FeatherPulsar`` sense -- plain attributes with
-  the names Enterprise binds by ``hasattr``, no properties, no live timing
-  object;
-* the in-memory form of the feather file (schema v1, :mod:`psrdata.feather`).
-
-It lives here rather than in a timing package because a frozen array record
-must not require a JAX engine to exist, and rather than in a protocol package
-because protocols are not products. Its dependencies are numpy and pyarrow.
-
-The record is also its own linear engine: :meth:`PulsarData.linear_engine`
-returns ``Δr = −Mmat δ`` in the shape nltiming's ``TimingEngine`` protocol
-describes (:mod:`psrdata.linear`), so a frozen linear timing analysis needs
-this file and nothing else -- no timing package, no inference package.
-
-**Row order is the writer's, and this package never changes it.** Row ``i`` of
-every array is row ``i`` as the producing timing package emitted it. A consumer
-that wants time order sorts on read: Enterprise already does, at its own
-property layer, and both consumers' ECORR quantization groups TOAs by value
-rather than adjacency, so neither needs sorted input. A timing package that
-sorts the rows its residual, Jacobian and design matrix are all built from
-publishes two orders for one freeze, reconciled by a permutation that is the
-identity on any already-ordered ``.tim`` and therefore never exercised.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
+import re
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from numbers import Real
+from typing import Any, Literal, Mapping, NamedTuple
 
 import numpy as np
 
-from .gauge import GaugeProvenance, coerce_gauge
+from .errors import RecordError
 
-if TYPE_CHECKING:  # pragma: no cover
-    from .linear import LinearTimingEngine
+#: The reserved data-set key psrdata inserts for scalar standalone metadata.
+SINGLE_KEY = "single"
 
-#: On-disk schema name and version. The columns are exactly the ones
-#: Enterprise's ``FeatherPulsar`` and Discovery's ``Pulsar`` already read; the
-#: metadata block is additive, so a reader that predates it ignores it.
-#:
-#: Wideband (schema still v1 until a producer emits it). A wideband TOA is one
-#: row with a second measurement, not a second row: PINT forbids mixing
-#: narrowband and wideband in one ``TOAs`` object, and Vela.jl's
-#: ``WidebandTOA`` is a TOA plus ``DMInfo(value, error)``. Enterprise's
-#: ``WidebandTimingModel`` already reads ``flags["pp_dm"]`` / ``flags["pp_dme"]``
-#: and ``dmx`` from this record — those flags can land in :attr:`flags` with
-#: no schema bump. A PINT/Vela residual engine needs the DM residual and its
-#: error as arrays (``dm_residuals``, ``dmerrs``, and a DM design matrix or a
-#: stacked ``(2N, n_fit)`` ``Mmat``); that is a new schema version, because
-#: old readers would otherwise treat ``Mmat`` as TOA-only. Keep ``DMJUMP`` on
-#: the par (it is a DM delay). Drop ``DMEFAC``/``DMEQUAD`` from
-#: :data:`psrdata.partext.NOISE_NAMES` once that ingest exists — they scale
-#: the DM error the way EFAC/EQUAD scale the TOA error. pyvela refuses ECORR
-#: on wideband.
-SCHEMA = "pulsardata-feather-v1"
+PARTIM_COMPATIBILITIES = ("pint", "tempo2")
 
-#: Enterprise planet slots: Mercury=0 ... Pluto=8.
-#:
-#: What the consumers actually read, measured, so that nobody "fixes" the NaNs:
-#:
-#: ==============================  =========================================
-#: reader                          slots
-#: ==============================  =========================================
-#: ``utils.physical_ephem_delay``  positions of 2 (Earth), 4, 5, 6, 7
-#: ``PhysicalEphemerisSignal``     the same
-#: Discovery ``solar.py``          slot 2 position, ``sunssb[:, :3]``
-#: anything                        **no velocity is read by any consumer**
-#: ==============================  =========================================
-#:
-#: Venus (slot 1) is filled whenever the producer had it: NaN-ing a column we
-#: hold, "for parity" with Enterprise's PINT path, would be theater.
-PLANET_SLOTS = {
-    "mercury": 0,
-    "venus": 1,
-    "earth": 2,
-    "mars": 3,
-    "jupiter": 4,
-    "saturn": 5,
-    "uranus": 6,
-    "neptune": 7,
-    "pluto": 8,
-}
+CENTERING_LITERALS = ("none", "mean_removed", "constant_removed", "unknown")
 
-#: Enterprise's backend-flag precedence, most specific last
-#: (``enterprise/pulsar.py``: ``fe_be`` base, then these overwrite where
-#: non-empty). The quirk is copied intact, not improved.
-BACKEND_FLAG_ORDER = ("f", "i", "sys", "g", "group")
+#: A phase-offset fit parameter: bare ``Offset``/``PHOFF`` or ``<name>_<key>``.
+PHASE_OFFSET_RE = re.compile(r"^(Offset|PHOFF)(?:_(.+))?$")
 
-#: Enterprise's fallback when the par carries no parallax.
-DEFAULT_DISTANCE_KPC = (1.0, 0.2)
+#: The unit of a phase-offset parameter's delta, by bare name (R-3.2.2).
+PHASE_OFFSET_UNITS = {"Offset": "s", "PHOFF": "dimensionless"}
+
+DMX_ENTRY_KEYS = ("DMX", "DMXerr", "DMXR1", "DMXR2", "fit")
+
+
+# --- value types ------------------------------------------------------------------
+
+
+@dataclass
+class ParameterFact:
+    """Value, PINT unit and optional uncertainty of one set parameter (§3.3)."""
+
+    value: str
+    units: str | None
+    uncertainty: str | None = None
+
+
+@dataclass
+class ResidualCentering:
+    """What centering the stored residuals carry, and what the package normally
+    applies (§4). Descriptive only: nothing in psrdata branches on it."""
+
+    stored_residuals: Literal["none", "mean_removed", "constant_removed", "unknown"]
+    stored_weighted: bool | None = None
+    standard_output: Literal["none", "mean_removed", "constant_removed", "unknown"] = (
+        "unknown"
+    )
+    standard_weighted: bool | None = None
+
+    def __post_init__(self):
+        validate_residual_centering(self)
+
+
+def validate_residual_centering(rc: ResidualCentering, where: str = "") -> None:
+    """R-4.1.1. Raised as ``RecordError`` at construction and at Feather read."""
+    prefix = f"{where}: " if where else ""
+    if not isinstance(rc, ResidualCentering):
+        raise RecordError(f"{prefix}expected a ResidualCentering, got {rc!r}")
+    for kind in ("stored", "standard"):
+        literal = getattr(
+            rc, "stored_residuals" if kind == "stored" else "standard_output"
+        )
+        weighted = getattr(rc, f"{kind}_weighted")
+        if literal not in CENTERING_LITERALS:
+            raise RecordError(
+                f"{prefix}{kind} residual centering {literal!r} is not one of "
+                f"{CENTERING_LITERALS}"
+            )
+        if literal == "mean_removed":
+            if not isinstance(weighted, bool):
+                raise RecordError(
+                    f"{prefix}{kind}_weighted must be a bool when the {kind} "
+                    f"centering is 'mean_removed', got {weighted!r}"
+                )
+        elif weighted is not None:
+            raise RecordError(
+                f"{prefix}{kind}_weighted must be None unless the {kind} "
+                f"centering is 'mean_removed', got {weighted!r}"
+            )
 
 
 class TOARows(NamedTuple):
-    """The three columns that identify a row.
+    """Ordered alignment signature for transitional two-read comparison (R-3.8.1)."""
 
-    Site arrival alone cannot separate simultaneous sub-band TOAs and frequency
-    alone cannot separate epochs; together they pin a row. Two codes holding
-    what should be the same data compare these to check that they do.
-    """
-
-    stoas: np.ndarray  # site arrival, seconds
-    freqs: np.ndarray  # MHz; inf where the timing package reported no frequency
-    toaerrs: np.ndarray  # seconds
+    stoas: np.ndarray
+    freqs: np.ndarray
+    toaerrs: np.ndarray
 
 
-def _readonly(array) -> np.ndarray:
-    out = np.asarray(array)
-    out.flags.writeable = False
-    return out
+# --- the record -------------------------------------------------------------------
+
+_FLOAT_ROW_FIELDS = ("toas", "stoas", "toaerrs", "residuals", "freqs")
+_STR_ROW_FIELDS = ("backend_flags", "telescope")
 
 
-def backend_flags(flags: Mapping[str, np.ndarray], n: int) -> np.ndarray:
-    """Enterprise's ``backend_flags`` recipe, precedence quirk intact.
-
-    ``fe_be`` is the base and the finer flags overwrite it where they are
-    non-empty, last one winning (``enterprise/pulsar.py:327``).
-    """
-    out = np.array([""] * n, dtype=object)
-    if "fe" in flags and "be" in flags:
-        out[:] = [
-            f"{fe}_{be}" if (fe and be) else ""
-            for fe, be in zip(flags["fe"], flags["be"])
-        ]
-    for name in BACKEND_FLAG_ORDER:
-        if name in flags:
-            out[:] = np.where(np.asarray(flags[name]) == "", out, flags[name])
-    return out.astype(str)
+def _as_float_array(name: str, value: Any) -> np.ndarray:
+    arr = np.asarray(value)
+    if arr.dtype.kind != "f":
+        raise RecordError(f"{name} must be a floating array, got dtype {arr.dtype}")
+    return arr
 
 
-@dataclass(frozen=True)
+def _as_str_array(name: str, value: Any) -> np.ndarray:
+    arr = np.asarray(value)
+    if arr.dtype.kind == "O":
+        if not all(isinstance(x, str) for x in arr.ravel()):
+            raise RecordError(f"{name} must contain only strings")
+    elif arr.dtype.kind not in "US":
+        raise RecordError(f"{name} must be a string array, got dtype {arr.dtype}")
+    return arr
+
+
+def _check_shape(name: str, arr: np.ndarray, shape: tuple[int, ...]) -> None:
+    if arr.shape != shape:
+        raise RecordError(f"{name} must have shape {shape}, got {arr.shape}")
+
+
+def _is_decimal(text: str) -> bool:
+    try:
+        Decimal(text)
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+    return True
+
+
+def _is_decimal_zero(text: str) -> bool:
+    try:
+        return Decimal(text) == 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def _require_finite(name: str, arr: np.ndarray) -> None:
+    if not np.isfinite(arr).all():
+        raise RecordError(f"{name} must be finite")
+
+
+def _require_finite_or_nan(name: str, arr: np.ndarray) -> None:
+    if np.isinf(arr).any():
+        raise RecordError(f"{name} must be finite or NaN")
+
+
+@dataclass(frozen=True, eq=False, kw_only=True)
 class PulsarData:
-    """The pulsar, frozen, in the writer's row order. Read-only array views."""
+    """One materialized timing calculation and the metadata to interpret it (§3.1).
+
+    Frozen at the attribute level only: arrays are stored as given, never
+    copied (SPEC-motivation §5). Row ``i`` of every row array is the
+    producer's row ``i`` (R-1.4).
+    """
 
     name: str
-    fitpars: tuple[str, ...]
     setpars: tuple[str, ...]
-    toas: np.ndarray  # barycentric arrival, seconds
-    stoas: np.ndarray  # site arrival, seconds
-    toaerrs: np.ndarray  # seconds
-    residuals: np.ndarray  # seconds
-    freqs: np.ndarray  # MHz
-    Mmat: np.ndarray  # (N, n_fit), fitter sign
+    fitpars: tuple[str, ...]
+    parameters: Mapping[str, ParameterFact]
+    toas: np.ndarray
+    stoas: np.ndarray
+    toaerrs: np.ndarray
+    residuals: np.ndarray
+    freqs: np.ndarray
+    Mmat: np.ndarray
     flags: Mapping[str, np.ndarray]
     backend_flags: np.ndarray
     telescope: np.ndarray
-    pos: np.ndarray  # (3,) ICRS unit vector
-    pos_t: np.ndarray  # (N, 3)
-    sunssb: np.ndarray  # (N, 6) lt-s
-    planetssb: np.ndarray  # (N, 9, 6); see PLANET_SLOTS
+    pos: np.ndarray
+    pos_t: np.ndarray
+    sunssb: np.ndarray
+    planetssb: np.ndarray
     theta: float
     phi: float
     pdist: tuple[float, float]
     dm: float
-    dmx: dict | None
-    state_id: str
-    #: Which package wrote this record: ``"metapulsar"``, ...
-    software: str
-    #: Which timing package read the files: ``"pint"``, ``"tempo2"``, or
-    #: ``"composite"`` for a record combining legs read by different ones.
-    timing_package: str
-    #: One :class:`~psrdata.gauge.GaugeProvenance`, or ``{leg: provenance}``
-    #: for a composite. A plain mapping of the field names is accepted and
-    #: validated on construction, which is also what the feather reader hands
-    #: in.
-    gauge: GaugeProvenance | Mapping[str, GaugeProvenance]
-    reference_theta_exact: Mapping[str, str]
-    native_units: Mapping[str, str]
-    #: Additive metadata a producer wants to carry (a composite's ``legs``,
-    #: its combination strategy, ...). Readers that do not know a key ignore it.
+    dmx: Mapping[str, Mapping[str, Any]] | None
+    timing_package: Mapping[str, str]
+    partim_compatibility: Mapping[str, Literal["pint", "tempo2"]]
+    residual_centering: Mapping[str, ResidualCentering]
+    producer: str
     extra: Mapping[str, Any] = field(default_factory=dict)
-    schema: str = SCHEMA
 
-    def __post_init__(self) -> None:
-        # Shapes are checked here rather than trusted, because every consumer
-        # binds these names by `hasattr` and a wrong-length column becomes a
-        # broadcasting bug three packages away.
+    # -- construction -----------------------------------------------------------
+
+    def __post_init__(self):
+        set_ = object.__setattr__
+
+        if not isinstance(self.name, str) or not self.name:
+            raise RecordError(f"name must be a nonempty string, got {self.name!r}")
+        if not isinstance(self.producer, str) or not self.producer:
+            raise RecordError(
+                f"producer must be a nonempty string, got {self.producer!r}"
+            )
+        if not isinstance(self.extra, Mapping):
+            raise RecordError(f"extra must be a mapping, got {type(self.extra)}")
+
+        # row arrays and shapes (R-3.2.1)
+        for name in _FLOAT_ROW_FIELDS:
+            set_(self, name, _as_float_array(name, getattr(self, name)))
+        for name in _STR_ROW_FIELDS:
+            set_(self, name, _as_str_array(name, getattr(self, name)))
+        if self.toas.ndim != 1:
+            raise RecordError(f"toas must have shape (n,), got {self.toas.shape}")
         n = len(self.toas)
-        for name in (
-            "stoas",
-            "toaerrs",
-            "residuals",
-            "freqs",
-            "backend_flags",
-            "telescope",
-        ):
-            if np.asarray(getattr(self, name)).shape != (n,):
-                raise ValueError(f"{name} must have shape ({n},)")
-        if np.asarray(self.Mmat).shape != (n, len(self.fitpars)):
-            raise ValueError(f"Mmat must have shape ({n}, {len(self.fitpars)})")
+        for name in _FLOAT_ROW_FIELDS + _STR_ROW_FIELDS:
+            _check_shape(name, getattr(self, name), (n,))
+
+        set_(self, "setpars", tuple(self.setpars))
+        set_(self, "fitpars", tuple(self.fitpars))
+        p = len(self.fitpars)
+        set_(self, "Mmat", _as_float_array("Mmat", self.Mmat))
+        _check_shape("Mmat", self.Mmat, (n, p))
         for name, shape in (
             ("pos", (3,)),
             ("pos_t", (n, 3)),
             ("sunssb", (n, 6)),
             ("planetssb", (n, 9, 6)),
         ):
-            if np.asarray(getattr(self, name)).shape != shape:
-                raise ValueError(f"{name} must have shape {shape}")
+            arr = _as_float_array(name, getattr(self, name))
+            _check_shape(name, arr, shape)
+            set_(self, name, arr)
+
+        # flags (R-3.2.1, R-3.2.4)
+        if not isinstance(self.flags, Mapping):
+            raise RecordError(f"flags must be a mapping, got {type(self.flags)}")
+        flags = {}
         for key, value in self.flags.items():
-            if np.asarray(value).shape != (n,):
-                raise ValueError(f"flags[{key!r}] must have shape ({n},)")
-        missing = [f for f in self.fitpars if f not in self.reference_theta_exact]
-        if missing:
-            raise ValueError(f"reference_theta_exact is missing fitpars {missing}")
-        object.__setattr__(
-            self,
-            "gauge",
-            coerce_gauge(self.gauge, composite=self.timing_package == "composite"),
-        )
+            if not isinstance(key, str) or not key:
+                raise RecordError(f"flag keys must be nonempty strings, got {key!r}")
+            arr = _as_str_array(f"flag {key!r}", value)
+            _check_shape(f"flag {key!r}", arr, (n,))
+            flags[key] = arr
+        set_(self, "flags", flags)
 
-        for f in fields(self):
-            value = getattr(self, f.name)
-            if isinstance(value, np.ndarray):
-                object.__setattr__(self, f.name, _readonly(value))
-        object.__setattr__(
-            self,
-            "flags",
-            {k: _readonly(np.asarray(v)) for k, v in self.flags.items()},
-        )
+        # finite values (R-3.2.5)
+        for name in ("toas", "stoas", "toaerrs", "residuals", "Mmat", "pos", "pos_t"):
+            _require_finite(name, getattr(self, name))
+        _require_finite("sunssb position", self.sunssb[..., :3])
+        _require_finite_or_nan("sunssb unused velocity", self.sunssb[..., 3:])
+        _require_finite_or_nan("planetssb", self.planetssb)
+        if np.isnan(self.freqs).any() or np.isneginf(self.freqs).any():
+            raise RecordError("freqs may contain +inf but not NaN or -inf")
 
-    def __len__(self) -> int:
-        return len(self.toas)
+        # parameter names and facts (R-3.2.2, R-3.3)
+        self._validate_parameters()
 
-    def __repr__(self) -> str:
-        return (
-            f"<psrdata.PulsarData {self.name}: {len(self.toas)} TOAs, "
-            f"{len(self.fitpars)} fitpars, software={self.software}, "
-            f"timing_package={self.timing_package}>"
+        # scalars
+        for name in ("theta", "phi", "dm"):
+            value = getattr(self, name)
+            if not isinstance(value, Real):
+                raise RecordError(f"{name} must be a float, got {value!r}")
+            value = float(value)
+            if not np.isfinite(value):
+                raise RecordError(f"{name} must be finite")
+            set_(self, name, value)
+        try:
+            d, e = self.pdist
+            pdist = (float(d), float(e))
+        except (TypeError, ValueError):
+            raise RecordError(
+                f"pdist must be a (distance, uncertainty) pair, got {self.pdist!r}"
+            ) from None
+        if not all(np.isfinite(x) for x in pdist):
+            raise RecordError("pdist must be finite")
+        set_(self, "pdist", pdist)
+        self._validate_dmx()
+
+        # data-set mappings (R-3.2.3, R-4.1.1)
+        self._normalize_data_set_mappings()
+
+    def _validate_parameters(self) -> None:
+        if len(set(self.setpars)) != len(self.setpars):
+            raise RecordError("setpars contains duplicate names")
+        if len(set(self.fitpars)) != len(self.fitpars):
+            raise RecordError("fitpars contains duplicate names")
+        setpars = set(self.setpars)
+        for name in self.fitpars:
+            if name not in setpars:
+                raise RecordError(f"fit parameter {name!r} is not in setpars")
+        if not isinstance(self.parameters, Mapping):
+            raise RecordError("parameters must be a mapping of ParameterFact")
+        for name in self.setpars:
+            if name not in self.parameters:
+                raise RecordError(f"set parameter {name!r} has no ParameterFact")
+        # A fact for a name outside setpars is refused: a parameter with a
+        # value is by definition set (§0, R-3.3.4).
+        for name in self.parameters:
+            if name not in setpars:
+                raise RecordError(
+                    f"parameters has an entry {name!r} that is not in setpars"
+                )
+        for name, fact in self.parameters.items():
+            if not isinstance(fact, ParameterFact):
+                raise RecordError(f"parameters[{name!r}] is not a ParameterFact")
+            if not isinstance(fact.value, str):
+                raise RecordError(f"parameters[{name!r}].value must be a string")
+            if fact.units is not None and not isinstance(fact.units, str):
+                raise RecordError(f"parameters[{name!r}].units must be str or None")
+            if fact.uncertainty is not None and not isinstance(fact.uncertainty, str):
+                raise RecordError(
+                    f"parameters[{name!r}].uncertainty must be str or None"
+                )
+        # A fit parameter is a matrix column, so it is numerical with a unit
+        # (R-3.3.2).
+        for name in self.fitpars:
+            fact = self.parameters[name]
+            if fact.units is None:
+                raise RecordError(f"fit parameter {name!r} has no unit")
+            if not _is_decimal(fact.value):
+                raise RecordError(
+                    f"fit parameter {name!r} has a non-decimal value {fact.value!r}"
+                )
+            if fact.uncertainty is not None and not _is_decimal(fact.uncertainty):
+                raise RecordError(
+                    f"fit parameter {name!r} has a non-decimal uncertainty "
+                    f"{fact.uncertainty!r}"
+                )
+            match = PHASE_OFFSET_RE.match(name)
+            if match is None:
+                continue
+            expected = PHASE_OFFSET_UNITS[match.group(1)]
+            if not _is_decimal_zero(fact.value) or fact.uncertainty is not None:
+                raise RecordError(
+                    f"phase-offset fit parameter {name!r} must have a decimal "
+                    f"value of exactly zero and no uncertainty, got {fact!r}"
+                )
+            if fact.units != expected:
+                raise RecordError(
+                    f"phase-offset fit parameter {name!r} must have units "
+                    f"{expected!r}, got {fact.units!r}"
+                )
+
+    def _validate_dmx(self) -> None:
+        dmx = self.dmx
+        if dmx is None:
+            return
+        if not isinstance(dmx, Mapping):
+            raise RecordError(f"dmx must be a mapping or None, got {type(dmx)}")
+        # An empty mapping is refused unconditionally: a model without DMX
+        # uses None, and an empty table on a model with DMX would silently
+        # disable Enterprise's wideband model (§3.1).
+        if not dmx:
+            raise RecordError(
+                "dmx is an empty mapping; use None for a model without DMX"
+            )
+        for name, entry in dmx.items():
+            if not isinstance(name, str) or not isinstance(entry, Mapping):
+                raise RecordError(f"dmx entry {name!r} is malformed")
+            missing = [k for k in DMX_ENTRY_KEYS if k not in entry]
+            if missing:
+                raise RecordError(f"dmx entry {name!r} lacks {missing}")
+            for k in ("DMX", "DMXR1", "DMXR2"):
+                if not isinstance(entry[k], Real):
+                    raise RecordError(f"dmx entry {name!r}[{k!r}] must be a float")
+            if entry["DMXerr"] is not None and not isinstance(entry["DMXerr"], Real):
+                raise RecordError(f"dmx entry {name!r}['DMXerr'] must be float or None")
+            if not isinstance(entry["fit"], bool):
+                raise RecordError(f"dmx entry {name!r}['fit'] must be a bool")
+
+    def _normalize_data_set_mappings(self) -> None:
+        set_ = object.__setattr__
+        tp, pc, rc = (
+            self.timing_package,
+            self.partim_compatibility,
+            self.residual_centering,
         )
+        scalar = (
+            isinstance(tp, str),
+            isinstance(pc, str),
+            isinstance(rc, ResidualCentering),
+        )
+        if all(scalar):
+            tp = {SINGLE_KEY: tp}
+            pc = {SINGLE_KEY: pc}
+            rc = {SINGLE_KEY: rc}
+        elif any(scalar):
+            raise RecordError(
+                "timing_package, partim_compatibility and residual_centering must "
+                "be supplied either all as scalar single-data-set values or all as "
+                "mappings"
+            )
+        for label, mapping in (
+            ("timing_package", tp),
+            ("partim_compatibility", pc),
+            ("residual_centering", rc),
+        ):
+            if not isinstance(mapping, Mapping):
+                raise RecordError(f"{label} must be a mapping, got {type(mapping)}")
+            if not mapping:
+                raise RecordError(f"{label} must be a nonempty mapping")
+            for key in mapping:
+                if not isinstance(key, str) or not key:
+                    raise RecordError(f"{label} has a non-string or empty key {key!r}")
+        keys = tuple(tp)
+        if set(pc) != set(keys) or set(rc) != set(keys):
+            raise RecordError(
+                "timing_package, partim_compatibility and residual_centering must "
+                f"have exactly the same data-set keys; got {sorted(tp)}, "
+                f"{sorted(pc)}, {sorted(rc)}"
+            )
+        for key, value in tp.items():
+            if not isinstance(value, str) or not value:
+                raise RecordError(
+                    f"timing_package[{key!r}] must be a nonempty string, got {value!r}"
+                )
+        for key, value in pc.items():
+            if value not in PARTIM_COMPATIBILITIES:
+                raise RecordError(
+                    f"partim_compatibility[{key!r}] must be one of "
+                    f"{PARTIM_COMPATIBILITIES}, got {value!r}"
+                )
+        for key, value in rc.items():
+            validate_residual_centering(value, f"residual_centering[{key!r}]")
+        # The three mappings are re-keyed in ``timing_package``'s insertion
+        # order so R-6.2.0's "same keys in the same insertion order" holds for
+        # every record.
+        set_(self, "timing_package", {k: tp[k] for k in keys})
+        set_(self, "partim_compatibility", {k: pc[k] for k in keys})
+        set_(self, "residual_centering", {k: rc[k] for k in keys})
+
+    # -- derived views -----------------------------------------------------------
+
+    @property
+    def data_set_keys(self) -> tuple[str, ...]:
+        """The data sets represented in the record (R-3.7.2)."""
+        return tuple(self.timing_package)
 
     def toa_rows(self) -> TOARows:
-        """The three columns that identify a row."""
+        """R-3.8.1."""
         return TOARows(self.stoas, self.freqs, self.toaerrs)
 
-    def linear_engine(self) -> "LinearTimingEngine":
-        """This record as its own linear engine, ``Δr = −Mmat δ``.
+    def linear_engine(self):
+        """The complete linear calculation over the record's matrix (§5)."""
+        from .linear import LinearTimingEngine
 
-        Single-leg or composite; see :func:`psrdata.linear.linear_engine`.
-        """
-        from .linear import linear_engine
-
-        return linear_engine(self)
-
-    def to_feather(self, path, *, noisedict=None) -> Path:
-        from .feather import write
-
-        return write(self, path, noisedict=noisedict)
+        return LinearTimingEngine.from_pulsar_data(self)
 
     @classmethod
     def from_feather(cls, path) -> "PulsarData":
@@ -259,13 +451,27 @@ class PulsarData:
 
         return read(path)
 
+    def to_feather(self, path, noisedict=None) -> None:
+        from .feather import write
+
+        write(self, path, noisedict=noisedict)
+
+    def __repr__(self) -> str:
+        return (
+            f"<PulsarData {self.name}: {len(self.toas)} rows, "
+            f"{len(self.fitpars)} fitpars, data sets {self.data_set_keys}>"
+        )
+
 
 __all__ = [
-    "PulsarData",
+    "SINGLE_KEY",
+    "PARTIM_COMPATIBILITIES",
+    "CENTERING_LITERALS",
+    "PHASE_OFFSET_RE",
+    "PHASE_OFFSET_UNITS",
+    "ParameterFact",
+    "ResidualCentering",
+    "validate_residual_centering",
     "TOARows",
-    "SCHEMA",
-    "PLANET_SLOTS",
-    "BACKEND_FLAG_ORDER",
-    "DEFAULT_DISTANCE_KPC",
-    "backend_flags",
+    "PulsarData",
 ]

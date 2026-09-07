@@ -5,7 +5,21 @@ from __future__ import annotations
 import subprocess
 import sys
 
-FORBIDDEN = ("pint", "jax", "astropy", "tempo2", "scipy", "pandas")
+# R-2.1: PINT, tempo2/libstempo, JAX, Astropy, SciPy, Enterprise, Discovery,
+# MetaPulsar and nltiming.
+FORBIDDEN = (
+    "pint",
+    "libstempo",
+    "tempo2",
+    "jax",
+    "astropy",
+    "scipy",
+    "enterprise",
+    "discovery",
+    "metapulsar",
+    "nltiming",
+    "pandas",
+)
 
 
 def test_importing_psrdata_pulls_in_no_timing_stack():

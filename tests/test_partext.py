@@ -6,6 +6,8 @@ import pytest
 
 from psrdata import ParTextError
 from psrdata.partext import (
+    NOISE_NAMES,
+    REPEATABLE_KEYS,
     active_lines,
     dedupe_nonrepeatable,
     effective_units,
@@ -158,3 +160,62 @@ def test_repeatable_keys_are_left_alone(text):
 def test_comments_survive_the_dedupe():
     text = "# header\nF0 1.0\nC note\nF0 1.0\n"
     assert dedupe_nonrepeatable(text) == "# header\nF0 1.0\nC note\n"
+
+
+def test_the_noise_name_membership_is_the_contract():
+    """R-7.2.1: the exact set, enumerated. Adding a name is a contract change."""
+    assert NOISE_NAMES == frozenset(
+        {
+            "EFAC", "T2EFAC", "TNEF", "TNEFAC",
+            "EQUAD", "T2EQUAD", "TNEQ", "TNEQUAD",
+            "TNGLOBALEF", "TNGLOBALEQ",
+            "ECORR", "TNECORR",
+            "DMEFAC", "DMEQUAD",
+            "RNAMP", "RNIDX",
+            "TNREDAMP", "TNREDGAM", "TNREDC", "TNREDF", "TNREDFC",
+            "TNREDFLOG", "TNREDFLOG_FACTOR", "TNREDTSPAN",
+            "TNDMAMP", "TNDMGAM", "TNDMC", "TNDMFLOG", "TNDMFLOG_FACTOR",
+            "TNDMTSPAN",
+            "TNCHROMAMP", "TNCHROMGAM", "TNCHROMC", "TNCHROMIDX",
+            "TNCHROMFLOG", "TNCHROMFLOG_FACTOR", "TNCHROMTSPAN",
+            "TNSWAMP", "TNSWGAM", "TNSWC", "TNSWFLOG", "TNSWFLOG_FACTOR",
+            "TNGAMMA", "TNAMP",
+            "PLREDFREQ", "PLREDAMP",
+            "TRES", "DMRES", "CHI2", "CHI2R",
+        }
+    )  # fmt: skip
+    assert "DMJUMP" not in NOISE_NAMES  # R-7.2.2
+
+
+def test_the_repeatable_keys_are_enumerated():
+    assert REPEATABLE_KEYS == frozenset(
+        {
+            "JUMP", "DMJUMP", "EFAC", "EQUAD", "ECORR", "T2EFAC", "T2EQUAD",
+            "TNEF", "TNEQ", "TNECORR", "DMEFAC", "DMEQUAD",
+        }
+    )  # fmt: skip
+
+
+def test_dmjump_is_a_timing_line_not_noise():
+    """R-7.2.2."""
+    assert not is_noise_line("DMJUMP -fe Rcvr 1e-3")
+    assert strip_noise_lines("DMJUMP -fe Rcvr 1e-3\n") == "DMJUMP -fe Rcvr 1e-3\n"
+
+
+def test_a_tab_after_the_tempo2_comment_marker_is_still_a_comment():
+    """R-7.1.1 speaks of the first *token*; whitespace kind does not matter."""
+    assert not is_active_line("C\tF0 1.0")
+    assert not is_noise_line("C\tEFAC -f x 1.0")
+
+
+def test_line_key_is_the_upper_cased_first_token():
+    from psrdata.partext import line_key
+
+    assert line_key("f0 1.0") == "F0"
+    assert line_key("  RAJ\t18:53") == "RAJ"
+
+
+def test_respelling_changes_the_first_token_only():
+    """R-7.4.1: a tab-separated tempo2 line keeps its remainder verbatim."""
+    assert respell_fdjump_for_pint("FDJUMP2\t-sys A\t1.0\n") == "FD2JUMP\t-sys A\t1.0\n"
+    assert respell_fdjump_for_pint("FDJUMPX 1.0\n") == "FDJUMPX 1.0\n"

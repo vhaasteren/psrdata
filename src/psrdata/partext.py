@@ -34,8 +34,7 @@ def is_active_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
         return False
-    upper = stripped.upper()
-    return not (upper == "C" or upper.startswith("C "))
+    return stripped.split()[0].upper() != "C"
 
 
 def active_lines(text: str) -> Iterator[str]:
@@ -145,16 +144,19 @@ def effective_units(text: str) -> str:
 
 # --- keyword respellings ---------------------------------------------------
 
-_FDJUMP_TEMPO2 = re.compile(r"^FDJUMP(\d+)$", re.I)
+_FDJUMP_TEMPO2 = re.compile(r"^(\s*)FDJUMP(\d+)(?=\s|$)", re.I)
 
 
 def respell_fdjump_for_pint(text: str) -> str:
-    """Rewrite tempo2 ``FDJUMPn`` mask parameters to PINT's ``FDnJUMP``."""
+    """Rewrite tempo2 ``FDJUMPn`` mask parameters to PINT's ``FDnJUMP``.
+
+    Only the first token changes; the rest of the line is kept verbatim.
+    """
     out = []
     for line in text.splitlines():
-        head, _, rest = line.partition(" ")
-        match = _FDJUMP_TEMPO2.match(head)
-        out.append(f"FD{int(match.group(1))}JUMP {rest}" if match else line)
+        out.append(
+            _FDJUMP_TEMPO2.sub(lambda m: f"{m.group(1)}FD{int(m.group(2))}JUMP", line)
+        )
     return "\n".join(out) + "\n"
 
 

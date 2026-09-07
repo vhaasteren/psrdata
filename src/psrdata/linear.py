@@ -1,338 +1,261 @@
-"""The record's own linear engine: ``Δr = −Mmat δ`` and nothing else.
+"""The record's linear engine: ``Δr = -Mmat @ δ`` (SPEC §3.6, §5).
 
-A record is the image of one evaluation of a timing model, and its
-linearization is complete in the record itself: ``Mmat`` in the fitter
-sign, the exact reference strings, the units, the per-leg gauge provenance.
-This module makes that identity callable, in the shape nltiming's
-``TimingEngine`` / ``JacobianTimingEngine`` protocols describe, **without
-importing nltiming**: the protocols are structural, this package defines
-nothing about live functions, and conformance is asserted by a
-``consumers``-marked test that runs nltiming's own ``isinstance`` checks
-when nltiming is installed (the same way the feather layout is asserted
-against Enterprise and Discovery).
+The engine follows nltiming's timing-engine interface structurally, without
+importing nltiming (R-5.4.1), and imports no JAX (R-5.2.10). A single-data-set
+and a combined record get the same engine; per-data-set structure is read off
+the phase-offset columns (R-3.7.3), never from stored partition metadata.
 
-Every optional hook nltiming reads by name has a well-defined linear answer
-and is declared here so a reader never has to guess:
-
-==========================  ==============================================
-hook                        the linear engine's answer
-==========================  ==============================================
-``identically_linear_fitpars``  every fitpar
-``nonlinear_params``        ``None`` (all axes linear; that is the executed mode)
-``binary_chart_capability`` ``None`` (no nonlinear map to chart)
-``contributions``           one per leg, derived from the matrix (composite)
-``gauge_direction``         the record's own named gauge column
-``residual_jacobian``       ``-Mmat``
-==========================  ==============================================
-
-There is no ``residual_delta_jax``: this package cannot import JAX. For a
-linear model the traced form is the same matrix product, and nltiming's JAX
-wrapper supplies it when NUTS needs it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from decimal import Decimal, localcontext
-from pathlib import Path
+from decimal import Decimal
 from typing import Any, Mapping
 
 import numpy as np
 
-from .gauge import GaugeProvenance
+from .errors import LinearEngineError
+from .record import SINGLE_KEY, ParameterFact, PulsarData, ResidualCentering
+
+ENGINE_NAME = "linear"
+
+PHASE_OFFSET_BARE_NAMES = ("Offset", "PHOFF")
 
 
-@dataclass(frozen=True)
-class LinearModel:
-    """Linearized residual model around the reference theta."""
+class _LinearBlock:
+    """Shared behaviour of the whole-record engine and one data-set contribution."""
 
-    fitpars: tuple[str, ...]
-    design: np.ndarray
-    theta_exact: Mapping[str, str]
-    native_units: Mapping[str, str]
-
-    @classmethod
-    def from_design(
-        cls,
-        *,
-        fitpars: tuple[str, ...],
-        design: np.ndarray,
-        theta_exact: Mapping[str, str] | None = None,
-        native_units: Mapping[str, str] | None = None,
-    ) -> "LinearModel":
-        if theta_exact is None:
-            theta_exact = {name: "0.0" for name in fitpars}
-        if native_units is None:
-            native_units = {name: "native" for name in fitpars}
-        return cls(
-            fitpars=tuple(fitpars),
-            design=np.asarray(design, dtype=float),
-            theta_exact=dict(theta_exact),
-            native_units=dict(native_units),
-        )
-
-    def reference_theta(self) -> np.ndarray:
-        with localcontext() as ctx:
-            ctx.prec = 50
-            return np.asarray(
-                [float(Decimal(self.theta_exact[name])) for name in self.fitpars],
-                dtype=float,
-            )
-
-    def residual_delta(self, delta_theta: np.ndarray) -> np.ndarray:
-        delta = np.asarray(delta_theta, dtype=float)
-        if delta.shape != (len(self.fitpars),):
-            raise ValueError("delta_theta shape mismatch with fitpars")
-        # Fitter sign: Δr ≈ -M δ
-        return -(self.design @ delta)
-
-
-@dataclass(frozen=True)
-class LinearContribution:
-    """One leg of a composite linear engine: its rows and its own linear leaf.
-
-    The attribute names (``name``, ``row_indices``, ``engine``) are the ones
-    nltiming reads off a composite's contributions; the two trailing fields
-    exist so a reader written against MetaPulsar's ``PtaContribution`` finds
-    them.
-    """
-
-    name: str
-    row_indices: np.ndarray
-    engine: "LinearTimingEngine"
-    exact_linear_fitpars: frozenset = frozenset()
-    fallback_reference_exact: Mapping[str, str] = field(default_factory=dict)
-
-
-def _record_gauge_column(fitpars: tuple[str, ...], leg: str | None) -> str:
-    """The named gauge column of a record, or of one leg of a composite one.
-
-    A leg's column carries the leg's name as its suffix (``Offset_epta``,
-    ``PHOFF_epta``); a single-leg record carries the bare name.
-    """
-    if leg is not None:
-        candidates = (f"Offset_{leg}", f"PHOFF_{leg}")
-        what = f"leg {leg!r}"
-    else:
-        candidates = ("Offset", "PHOFF")
-        what = "the record"
-    found = [name for name in candidates if name in fitpars]
-    if len(found) != 1:
-        raise ValueError(
-            f"{what} must carry exactly one named gauge column among "
-            f"{candidates}; found {found} in fitpars {list(fitpars)}"
-        )
-    return found[0]
-
-
-class LinearTimingEngine:
-    """``-Mmat @ delta`` over a :class:`LinearModel`, in nltiming's engine shape.
-
-    With ``contributions`` it is a composite: ``residual_delta`` is still the
-    one matrix product over the whole matrix, and the contributions exist so
-    readers that want per-leg facts (nltiming's gauge check, its per-leg
-    gauge provenance in the context and the manifest) find them. Such an
-    engine has no gauge provenance of its own, exactly like MetaPulsar's live
-    composite.
-    """
-
-    engine_name = "linear"
-
-    #: The hybrid residual mode this engine executes: every axis linear.
-    nonlinear_params = None
+    engine_name: str = ENGINE_NAME
+    nonlinear_params: None = None
 
     def __init__(
         self,
-        model: LinearModel,
-        *,
-        gauge_provenance: GaugeProvenance | None = None,
-        contributions: list[LinearContribution] | None = None,
+        Mmat: np.ndarray,
+        fitpars: tuple[str, ...],
+        parameters: Mapping[str, ParameterFact],
     ):
-        if gauge_provenance is None and not contributions:
-            raise TypeError(
-                "LinearTimingEngine requires gauge_provenance unless it is a "
-                "composite with contributions"
-            )
-        self._model = model
-        self._gauge_provenance = gauge_provenance
-        self.contributions = list(contributions) if contributions else None
-        self.fitpars = model.fitpars
-        self.native_units = dict(model.native_units)
+        self._Mmat = Mmat
+        self._fitpars = tuple(fitpars)
+        self._facts = {name: parameters[name] for name in self._fitpars}
 
-    # --- construction from a record ------------------------------------
+    # -- fit coordinates (R-5.2.1 .. R-5.2.4) -----------------------------------
+
+    @property
+    def fitpars(self) -> tuple[str, ...]:
+        return self._fitpars
+
+    @property
+    def native_units(self) -> dict[str, str]:
+        """Mapping of each fit parameter to its PINT unit, in fitpar order (R-5.2.2)."""
+        return {name: fact.units for name, fact in self._facts.items()}
+
+    def reference_theta_exact(self) -> dict[str, str]:
+        """Mapping of each fit parameter to its decimal value string, in fitpar
+        order (R-5.2.3). This is the authority for the recorded reference."""
+        return {name: fact.value for name, fact in self._facts.items()}
+
+    def reference_theta(self) -> np.ndarray:
+        """Derived float64 reference vector (R-5.2.4, R-3.3.5).
+
+        Each entry is the correctly rounded value of the decimal string, with
+        no intermediate float round trip. float64 is not the authority for a
+        parameter such as ``F0``; read ``reference_theta_exact()`` for the
+        recorded digits.
+        """
+        return np.array(
+            [float(Decimal(fact.value)) for fact in self._facts.values()],
+            dtype=np.float64,
+        )
+
+    @property
+    def linear_fitpars(self) -> tuple[str, ...]:
+        """Compatibility field carrying the exactly linear parameters (R-5.3.2):
+        every fit parameter of a linear block."""
+        return self._fitpars
+
+    def identically_linear_fitpars(self) -> tuple[str, ...]:
+        """R-5.2.8: every fit parameter."""
+        return self._fitpars
+
+    # -- the calculation (R-5.2.5 .. R-5.2.7) -----------------------------------
+
+    def residual_delta(self, delta) -> np.ndarray:
+        """``-Mmat @ δ`` for ``δ`` of shape ``(p,)`` in fitpar order and PINT units."""
+        delta = np.asarray(delta, dtype=np.float64)
+        p = len(self._fitpars)
+        if delta.shape != (p,):
+            raise LinearEngineError(
+                f"delta must have shape ({p},) for fitpars {self._fitpars}, "
+                f"got {delta.shape}"
+            )
+        return -(self._Mmat @ delta)
+
+    def design_matrix(self, params=None) -> np.ndarray:
+        """``Mmat``. A linear engine has one design matrix (R-5.2.6)."""
+        if params is not None:
+            raise LinearEngineError(
+                "the linear engine's design matrix is the record's Mmat and takes "
+                "no parameter values; pass params=None"
+            )
+        return self._Mmat
+
+    def residual_jacobian(self, params=None) -> np.ndarray:
+        """``-Mmat`` (R-5.2.7)."""
+        if params is not None:
+            raise LinearEngineError(
+                "the linear engine's residual Jacobian is -Mmat and takes no "
+                "parameter values; pass params=None"
+            )
+        return -self._Mmat
+
+    def binary_chart_capability(self, *args: Any, **kwargs: Any) -> None:
+        """R-5.2.9: a linear engine has no binary chart."""
+        return None
+
+
+class LinearContribution(_LinearBlock):
+    """One data set's block of the linear calculation (§5.3).
+
+    Its rows are the support of its phase-offset column; its fit parameters
+    are the columns nonzero on those rows, in global fitpar order.
+    """
+
+    def __init__(
+        self,
+        *,
+        key: str,
+        rows: np.ndarray,
+        column_indices: tuple[int, ...],
+        phase_offset: str,
+        record: PulsarData,
+    ):
+        fitpars = tuple(record.fitpars[j] for j in column_indices)
+        super().__init__(
+            record.Mmat[np.ix_(rows, list(column_indices))], fitpars, record.parameters
+        )
+        self.key = key
+        self.rows = rows
+        self.column_indices = column_indices
+        self.phase_offset = phase_offset
+        self.timing_package: str = record.timing_package[key]
+        self.partim_compatibility: str = record.partim_compatibility[key]
+        self.residual_centering: ResidualCentering = record.residual_centering[key]
+        self.residuals = record.residuals[rows]
+
+    def __repr__(self) -> str:
+        return (
+            f"<LinearContribution {self.key!r}: {len(self.rows)} rows, "
+            f"fitpars {self.fitpars}>"
+        )
+
+
+class LinearTimingEngine(_LinearBlock):
+    """The complete linear calculation over a record's matrix (§5)."""
+
+    def __init__(self, record: PulsarData):
+        super().__init__(record.Mmat, record.fitpars, record.parameters)
+        self.record = record
+        self._contributions = _decompose(record)
 
     @classmethod
-    def from_pulsar_data(cls, record) -> "LinearTimingEngine":
-        """The linear engine of a record; see :func:`linear_engine`."""
-        return linear_engine(record)
+    def from_pulsar_data(cls, record: PulsarData) -> "LinearTimingEngine":
+        return cls(record)
 
     @classmethod
     def from_feather(cls, path) -> "LinearTimingEngine":
-        """The same, from a schema-v1 feather file and nothing else."""
         from .feather import read
 
-        return linear_engine(read(Path(path)))
+        return cls(read(path))
 
-    # --- TimingEngine ------------------------------------------------------
-
-    def reference_theta(self) -> np.ndarray:
-        return self._model.reference_theta()
-
-    def reference_theta_exact(self) -> Mapping[str, str]:
-        return dict(self._model.theta_exact)
-
-    def residual_delta(self, delta_theta: np.ndarray) -> np.ndarray:
-        return self._model.residual_delta(delta_theta)
-
-    def design_matrix(self, params: Any | None = None) -> np.ndarray:
-        _ = params
-        return np.asarray(self._model.design, dtype=float)
-
-    def gauge_provenance(self) -> GaugeProvenance:
-        if self._gauge_provenance is None:
-            raise AttributeError(
-                "a composite LinearTimingEngine has no own gauge_provenance; "
-                "read it per contribution"
-            )
-        return self._gauge_provenance
+    # -- per-data-set views (§5.3) ---------------------------------------------
 
     @property
-    def gauge_applied(self) -> bool:
-        if self._gauge_provenance is None:
-            # OR over leaves, as MetaPulsar's composite does: diagnostic only.
-            return any(
-                bool(getattr(c.engine, "gauge_applied", False))
-                for c in self.contributions or ()
-            )
-        return self.gauge_provenance().export != "none"
+    def timing_package(self) -> Mapping[str, str]:
+        return self.record.timing_package
 
-    # --- JacobianTimingEngine ------------------------------------------------
+    @property
+    def partim_compatibility(self) -> Mapping[str, str]:
+        return self.record.partim_compatibility
 
-    def residual_jacobian(self) -> np.ndarray:
-        """J = -M for the linearized model."""
-        return -np.asarray(self._model.design, dtype=float)
+    @property
+    def residual_centering(self) -> Mapping[str, ResidualCentering]:
+        """One entry per data set, for one or several alike (R-5.3.4)."""
+        return self.record.residual_centering
 
-    # --- the optional hooks, each with its linear answer -------------------
+    @property
+    def data_set_keys(self) -> tuple[str, ...]:
+        return tuple(self._contributions)
 
-    def identically_linear_fitpars(self) -> frozenset[str]:
-        """A linear model is affine in every delta, so every fitpar qualifies."""
-        return frozenset(self.fitpars)
-
-    def binary_chart_capability(self, chart_family: str, suffix: str):
-        """A linear model has no nonlinear binary map to chart: never a candidate."""
-        _ = (chart_family, suffix)
-        return None
+    def contributions(self) -> dict[str, LinearContribution]:
+        """The per-data-set contributions (§5.3), keyed by data-set key in the
+        record's data-set order."""
+        return dict(self._contributions)
 
     def __repr__(self) -> str:
-        legs = "" if self.contributions is None else f", {len(self.contributions)} legs"
-        return f"<psrdata.LinearTimingEngine {len(self.fitpars)} fitpars{legs}>"
-
-
-class RecordLinearTimingEngine(LinearTimingEngine):
-    """The linear engine of one record, or of one leg of a composite record.
-
-    Its gauge direction is its own named gauge column. A record's ``Mmat`` is
-    the producing engine's design matrix, so the column named ``Offset`` or
-    ``PHOFF`` (suffixed on a leg) *is* the direction an unmeasurable phase
-    offset moves this record's residual: exactly the constant vector for a
-    PINT or tempo2 record, whose matrices divide by the constant ``F0``, and
-    ``1/F(t_i)`` for a vela-jax record, whose matrix is ``-J`` of a residual
-    divided by the spin Taylor series. The two differ by ``F1 * T / F0``,
-    about 4e-8 on B1937+21 over twenty years, above the 1e-8 nltiming's
-    gauge check lives at. Declaring the column lets that check test what is
-    true of the record rather than the constant; a zero column still fails,
-    because a zero direction is refused.
-    """
-
-    def __init__(
-        self,
-        model: LinearModel,
-        *,
-        gauge_provenance: GaugeProvenance,
-        gauge_column: str,
-    ):
-        super().__init__(model, gauge_provenance=gauge_provenance)
-        if gauge_column not in self.fitpars:
-            raise ValueError(
-                f"gauge column {gauge_column!r} is not among fitpars "
-                f"{list(self.fitpars)}"
-            )
-        self.gauge_column = gauge_column
-
-    def gauge_direction(self) -> np.ndarray:
-        column = self.fitpars.index(self.gauge_column)
-        return np.asarray(self._model.design[:, column], dtype=float)
-
-
-def linear_engine(record) -> LinearTimingEngine:
-    """The linear engine of a record, single-leg or composite.
-
-    The engine is ``-Mmat @ delta`` over the record's own matrix either way;
-    that matrix is all the linearized model is. A composite record
-    (``timing_package == "composite"``) carries one gauge provenance per leg,
-    keyed by leg name, and the matrix carries the rest: a leg's rows are the
-    support of its named gauge column (``Offset_<leg>`` / ``PHOFF_<leg>``),
-    and the parameters it owns are the columns nonzero on those rows. Each
-    leg becomes a :class:`LinearContribution` with its own
-    :class:`RecordLinearTimingEngine` leaf, so nltiming's per-contribution
-    readers see the shape MetaPulsar's live composite gives them.
-    """
-    fitpars = tuple(record.fitpars)
-    design = np.asarray(record.Mmat, dtype=float)
-    theta_exact = dict(record.reference_theta_exact)
-    native_units = dict(record.native_units)
-    model = LinearModel.from_design(
-        fitpars=fitpars,
-        design=design,
-        theta_exact=theta_exact,
-        native_units=native_units,
-    )
-    if record.timing_package != "composite":
-        return RecordLinearTimingEngine(
-            model,
-            gauge_provenance=GaugeProvenance.from_mapping(record.gauge),
-            gauge_column=_record_gauge_column(fitpars, None),
+        return (
+            f"<LinearTimingEngine {self.record.name}: {self._Mmat.shape[0]} rows, "
+            f"{len(self.fitpars)} fitpars, data sets {self.data_set_keys}>"
         )
 
-    n_toa, n_fit = design.shape
-    contributions: list[LinearContribution] = []
-    for leg, provenance in dict(record.gauge).items():
-        column = _record_gauge_column(fitpars, leg)
-        rows = np.flatnonzero(design[:, fitpars.index(column)])
-        if rows.size == 0:
-            raise ValueError(
-                f"gauge column {column!r} of leg {leg!r} is numerically zero"
-            )
-        owned = [j for j in range(n_fit) if np.any(design[rows, j])]
-        leaf_fitpars = tuple(fitpars[j] for j in owned)
-        leaf = RecordLinearTimingEngine(
-            LinearModel.from_design(
-                fitpars=leaf_fitpars,
-                design=design[np.ix_(rows, owned)],
-                theta_exact={name: theta_exact[name] for name in leaf_fitpars},
-                native_units={
-                    name: native_units.get(name, "native") for name in leaf_fitpars
-                },
-            ),
-            gauge_provenance=GaugeProvenance.from_mapping(provenance),
-            gauge_column=column,
+
+def locate_phase_offset(record: PulsarData, key: str) -> str:
+    """The name of data set ``key``'s phase-offset fit parameter (R-3.6.1)."""
+    candidates = [f"{bare}_{key}" for bare in PHASE_OFFSET_BARE_NAMES]
+    if len(record.timing_package) == 1:
+        candidates += list(PHASE_OFFSET_BARE_NAMES)
+    present = [name for name in candidates if name in record.fitpars]
+    if len(present) != 1:
+        raise LinearEngineError(
+            f"data set {key!r} needs exactly one phase-offset fit parameter among "
+            f"{candidates}; found {present}"
         )
-        contributions.append(
-            LinearContribution(name=str(leg), row_indices=rows, engine=leaf)
+    return present[0]
+
+
+def _decompose(record: PulsarData) -> dict[str, LinearContribution]:
+    """R-5.3.1: rows from phase-offset support, columns from activity."""
+    n = record.Mmat.shape[0]
+    keys = tuple(record.timing_package)
+    names = {key: locate_phase_offset(record, key) for key in keys}
+    supports = {}
+    for key, name in names.items():
+        column = record.Mmat[:, record.fitpars.index(name)]
+        supports[key] = np.flatnonzero(column != 0.0)
+    membership = np.zeros(n, dtype=int)
+    for rows in supports.values():
+        membership[rows] += 1
+    if (membership != 1).any():
+        overlap = np.flatnonzero(membership > 1)
+        gap = np.flatnonzero(membership == 0)
+        raise LinearEngineError(
+            "the phase-offset columns do not partition the rows: "
+            f"{len(overlap)} rows in more than one support, {len(gap)} rows in "
+            f"none (columns {tuple(names.values())})"
         )
-    covered = np.sort(np.concatenate([c.row_indices for c in contributions]))
-    if not np.array_equal(covered, np.arange(n_toa)):
-        raise ValueError(
-            "the legs' gauge columns must partition the rows: every row "
-            "in exactly one leg's support"
+    contributions = {}
+    for key in keys:
+        rows = supports[key]
+        active = np.flatnonzero((record.Mmat[rows] != 0.0).any(axis=0))
+        contributions[key] = LinearContribution(
+            key=key,
+            rows=rows,
+            column_indices=tuple(int(j) for j in active),
+            phase_offset=names[key],
+            record=record,
         )
-    return LinearTimingEngine(model, contributions=contributions)
+    return contributions
+
+
+def linear_engine(record: PulsarData) -> LinearTimingEngine:
+    """``psrdata.linear_engine(record)`` (§5.1)."""
+    return LinearTimingEngine.from_pulsar_data(record)
 
 
 __all__ = [
-    "LinearModel",
-    "LinearContribution",
+    "ENGINE_NAME",
+    "SINGLE_KEY",
     "LinearTimingEngine",
-    "RecordLinearTimingEngine",
+    "LinearContribution",
     "linear_engine",
+    "locate_phase_offset",
 ]

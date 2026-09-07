@@ -21,19 +21,22 @@ Four things, each of which was being duplicated or defined one layer too high:
 
 1. **`PulsarData`** — a frozen record of named arrays (TOAs, residuals, design
    matrix, flags, ephemeris vectors) plus the metadata that makes it
-   self-describing: which software wrote it, which timing package read the
-   files, the exact reference parameter values, the units, the gauge
-   provenance. `feather.write`/`read` are its on-disk form, schema
+   self-describing: which software wrote it (`producer`), which timing
+   package calculated each data set's residuals and matrix (`timing_package`),
+   which of PINT or tempo2 read the files (`partim_compatibility`), the exact
+   reference parameter values and PINT units (`parameters`), and the residual
+   centering per data set. `feather.write`/`read` are its on-disk form, schema
    `pulsardata-feather-v1`, whose columns are exactly what Enterprise's
    `FeatherPulsar` and Discovery's `Pulsar` already read.
 2. **The record's linear engine** — `PulsarData.linear_engine()` returns
    `Δr = −Mmat δ` over the record's own matrix, single-leg or composite, in
    the shape nltiming's `TimingEngine` protocol describes, without importing
-   nltiming. A composite declares no partition: a leg's rows are the support
-   of its named gauge column, and the parameters it owns are the columns
-   nonzero on those rows.
-3. **`GaugeProvenance`** — the validated type of the `gauge` field, here
-   because it is serialized in the record. nltiming re-exports it.
+   nltiming. A combined record declares no partition: a data set's rows are
+   the support of its phase-offset column (`Offset_<key>` or `PHOFF_<key>`),
+   and its active linear columns are the ones nonzero on those rows.
+3. **`ParameterFact` and `ResidualCentering`** — the validated value types of
+   the `parameters` and `residual_centering` fields, here because they are
+   serialized in the record.
 4. **`partext`** — the par-file rules that are pure text: which lines are
    noise hyperparameters, what `UNITS` means, the two keyword respellings PINT
    and tempo2 disagree about, and collapsing a doubled non-repeatable line.
@@ -57,5 +60,4 @@ identity on most real files and therefore never exercised.
 `MetaPulsar` (one record per multi-PTA composite), `vela-jax` (one per pulsar)
 and any other timing package that emits the record. Enterprise and Discovery
 read the feather with their own readers and never import this package.
-`nltiming` consumes the record and its linear engine, and re-exports
-`LinearTimingEngine`, `LinearModel` and `GaugeProvenance` from here.
+`nltiming` consumes the record and its linear engine.

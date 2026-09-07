@@ -393,6 +393,14 @@ native_units             = fitpar PINT units
 
 This leaves one authority for each value.
 
+`reference_theta()` is not that authority. It is a float64 array derived by
+correctly rounding each decimal string. float64 is too little precision to
+carry a millisecond-pulsar `F0` over a PTA span, which is why the facts
+store decimal strings and why a consumer that needs the recorded digits
+reads `reference_theta_exact()`. The linear calculation `Δr = -Mmat @ δ`
+remains float64 because `Mmat` is float64; a higher-precision reference
+vector would not recover those bits.
+
 ### 8.3 What is deliberately not stored
 
 The record does not store:
@@ -494,7 +502,8 @@ psrdata can validate:
 - parameter facts existing for all set parameters;
 - agreement of data-set mapping keys;
 - the phase-offset-column partition;
-- values required for linear algebra being finite.
+- numeric fields being finite, except `+inf` in `freqs` and `NaN` in
+  `planetssb` and unused velocity columns.
 
 It cannot independently validate:
 

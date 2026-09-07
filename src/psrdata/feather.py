@@ -1,25 +1,35 @@
-"""Feather schema v1: the on-disk form of :class:`~psrdata.record.PulsarData`.
+"""Feather schema v1, ``pulsardata-feather-v1`` (SPEC §6).
 
-The columns are frozen exactly as Enterprise's ``FeatherPulsar`` and
-Discovery's ``Pulsar`` already read them, so a file written here is consumable
-by both with no adapter. The metadata block is the addition: ``fitpars``,
-``Mmat``, the exact reference strings, the units and the gauge provenance all
-travel with the file, which is what lets a frozen linear timing analysis be
-rebuilt from it alone, with no timing package installed.
+The column layout is Enterprise's, so ``enterprise.pulsar.FeatherPulsar`` and
+``discovery.pulsar.Pulsar`` read these files with no adapter (R-6.3.2). The
+psrdata record is rebuilt from the additive JSON metadata and nothing else
+(R-6.2.0). Both readers pick vector columns up by *column order*, so the
+writer emits ``Mmat_0 .. Mmat_{p-1}`` in index order and never lets another
+column start with a reserved prefix.
+
+The codec entry points are ``write(record, path, noisedict=None)``,
+``read(path)`` and ``read_metadata(path)``; ``PulsarData.from_feather`` /
+``to_feather`` and ``LinearTimingEngine.from_feather`` go through them.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any
+import re
+from dataclasses import asdict
+from typing import Any, Mapping
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.feather as pa_feather
 
-from .gauge import gauge_to_json
-from .record import SCHEMA, PulsarData
+from .errors import SchemaError
+from .record import ParameterFact, PulsarData, ResidualCentering
 
-_COLUMNS = (
+#: R-6.2.1.
+SCHEMA = "pulsardata-feather-v1"
+
+SCALAR_COLUMNS = (
     "toas",
     "stoas",
     "toaerrs",
@@ -28,126 +38,338 @@ _COLUMNS = (
     "backend_flags",
     "telescope",
 )
-_VECTORS = ("Mmat", "sunssb", "pos_t")
-_TENSORS = ("planetssb",)
+FLOAT_COLUMNS = ("toas", "stoas", "toaerrs", "residuals", "freqs")
+VECTOR_COLUMNS = ("Mmat", "sunssb", "pos_t")
+TENSOR_COLUMNS = ("planetssb",)
+FLAG_PREFIX = "flags_"
+
+ENTERPRISE_KEYS = (
+    "name",
+    "dm",
+    "dmx",
+    "pdist",
+    "_pdist",
+    "pos",
+    "phi",
+    "theta",
+    "fitpars",
+    "setpars",
+)
+PSRDATA_KEYS = (
+    "schema",
+    "parameters",
+    "timing_package",
+    "partim_compatibility",
+    "residual_centering",
+    "producer",
+    "extra",
+)
+
+_VECTOR_RE = re.compile(r"^(Mmat|sunssb|pos_t)_(\d+)$")
+_TENSOR_RE = re.compile(r"^(planetssb)_(\d+)_(\d+)$")
 
 
-def write(record: PulsarData, path, *, noisedict=None) -> Path:
-    """Write ``record`` as a schema-v1 feather file."""
-    import pyarrow
-    import pyarrow.feather
+# --- writing ------------------------------------------------------------------------
 
-    table: dict[str, Any] = {
-        name: np.asarray(getattr(record, name)) for name in _COLUMNS
-    }
-    for name in _VECTORS:
-        block = np.asarray(getattr(record, name))
-        table.update({f"{name}_{i}": block[:, i] for i in range(block.shape[1])})
-    for name in _TENSORS:
-        block = np.asarray(getattr(record, name))
-        table.update(
-            {
-                f"{name}_{i}_{j}": block[:, i, j]
-                for i in range(block.shape[1])
-                for j in range(block.shape[2])
-            }
-        )
-    table.update({f"flags_{key}": value for key, value in record.flags.items()})
 
-    meta = {
+def _json_default(obj):
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"{type(obj).__name__} is not JSON serializable")
+
+
+def _metadata(record: PulsarData, noisedict) -> dict[str, Any]:
+    pdist = [float(record.pdist[0]), float(record.pdist[1])]
+    meta: dict[str, Any] = {
         "name": record.name,
-        "dm": record.dm,
-        "dmx": record.dmx,
-        "pdist": list(record.pdist),
-        # Enterprise's FeatherPulsar reads both spellings and prints a
-        # complaint for the one it cannot find; writing both keeps a stock
-        # reader quiet without adding a field.
-        "_pdist": list(record.pdist),
-        "pos": np.asarray(record.pos).tolist(),
-        "phi": record.phi,
-        "theta": record.theta,
+        "dm": float(record.dm),
+        "dmx": (
+            None if record.dmx is None else {k: dict(v) for k, v in record.dmx.items()}
+        ),
+        "pdist": pdist,
+        # Enterprise's FeatherPulsar reads both ``pdist`` and ``_pdist``; they
+        # carry the same pair.
+        "_pdist": list(pdist),
+        "pos": [float(x) for x in record.pos],
+        "phi": float(record.phi),
+        "theta": float(record.theta),
         "fitpars": list(record.fitpars),
         "setpars": list(record.setpars),
-        "schema": record.schema,
-        "state_id": record.state_id,
-        "software": record.software,
-        "timing_package": record.timing_package,
-        "gauge": gauge_to_json(record.gauge),
-        "reference_theta_exact": dict(record.reference_theta_exact or {}),
-        "native_units": dict(record.native_units or {}),
-        "extra": dict(record.extra or {}),
+        "schema": SCHEMA,
+        "parameters": {
+            name: {
+                "value": fact.value,
+                "units": fact.units,
+                "uncertainty": fact.uncertainty,
+            }
+            for name, fact in record.parameters.items()
+        },
+        "timing_package": dict(record.timing_package),
+        "partim_compatibility": dict(record.partim_compatibility),
+        "residual_centering": {
+            key: asdict(rc) for key, rc in record.residual_centering.items()
+        },
+        "producer": record.producer,
+        "extra": dict(record.extra),
     }
     if noisedict:
-        # Enterprise's convention: only this pulsar's entries, keyed by name.
+        # Enterprise's convention: keys that start with the pulsar name.
         meta["noisedict"] = {
-            key: value
-            for key, value in noisedict.items()
-            if key.startswith(record.name)
+            par: val for par, val in noisedict.items() if par.startswith(record.name)
         }
-    pyarrow.feather.write_feather(
-        pyarrow.Table.from_pydict(table, metadata={"json": json.dumps(meta)}),
-        str(path),
+    return meta
+
+
+def write(record: PulsarData, path, noisedict: Mapping[str, Any] | None = None) -> None:
+    """Write ``record`` at ``path`` in schema v1.
+
+    ``noisedict`` is optional and is filtered to this pulsar using Enterprise's
+    convention. Everything about the record is written; nothing is sorted.
+    """
+    columns: dict[str, Any] = {}
+    for name in FLOAT_COLUMNS:
+        columns[name] = np.asarray(getattr(record, name), dtype=np.float64)
+    columns["backend_flags"] = record.backend_flags
+    columns["telescope"] = record.telescope
+    for name in VECTOR_COLUMNS:
+        arr = np.asarray(getattr(record, name), dtype=np.float64)
+        for i in range(arr.shape[1]):
+            columns[f"{name}_{i}"] = arr[:, i]
+    for name in TENSOR_COLUMNS:
+        arr = np.asarray(getattr(record, name), dtype=np.float64)
+        for i in range(arr.shape[1]):
+            for j in range(arr.shape[2]):
+                columns[f"{name}_{i}_{j}"] = arr[:, i, j]
+    for key, value in record.flags.items():
+        columns[f"{FLAG_PREFIX}{key}"] = np.asarray(value).astype("U")
+
+    meta = _metadata(record, noisedict)
+    try:
+        text = json.dumps(meta, default=_json_default)
+    except (TypeError, ValueError) as exc:
+        raise SchemaError(
+            f"record metadata is not JSON serializable (check extra/dmx): {exc}"
+        ) from exc
+    table = pa.Table.from_pydict(columns, metadata={"json": text})
+    pa_feather.write_feather(table, str(path))
+
+
+# --- reading ------------------------------------------------------------------------
+
+
+def read_metadata(path) -> dict[str, Any]:
+    """The JSON metadata object of a psrdata file, schema-checked but otherwise raw.
+
+    This is where an optional key such as ``noisedict`` is found; ``read``
+    rebuilds the record from the required keys only.
+    """
+    return _checked_metadata(pa_feather.read_table(str(path)), str(path))
+
+
+def _checked_metadata(table: pa.Table, where: str) -> dict[str, Any]:
+    raw = (table.schema.metadata or {}).get(b"json")
+    if raw is None:
+        raise SchemaError(f"{where}: no 'json' schema metadata; not a psrdata file")
+    try:
+        meta = json.loads(raw)
+    except ValueError as exc:
+        raise SchemaError(f"{where}: schema metadata is not valid JSON: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise SchemaError(f"{where}: schema metadata is not a JSON object")
+    if "schema" not in meta:
+        raise SchemaError(
+            f"{where}: no 'schema' key in the metadata; refusing to guess the layout"
+        )
+    if meta["schema"] != SCHEMA:
+        raise SchemaError(
+            f"{where}: unsupported schema {meta['schema']!r}; this reader "
+            f"understands {SCHEMA!r} only"
+        )
+    return meta
+
+
+def _require(meta: Mapping[str, Any], key: str, where: str) -> Any:
+    if key not in meta:
+        raise SchemaError(f"{where}: required metadata key {key!r} is missing")
+    return meta[key]
+
+
+def _str_or_none(value, what: str, where: str) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    raise SchemaError(f"{where}: {what} must be a string or null, got {value!r}")
+
+
+def _parameters(meta, where) -> dict[str, ParameterFact]:
+    raw = _require(meta, "parameters", where)
+    if not isinstance(raw, dict):
+        raise SchemaError(f"{where}: 'parameters' must be a JSON object")
+    facts = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict) or set(entry) != {
+            "value",
+            "units",
+            "uncertainty",
+        }:
+            raise SchemaError(
+                f"{where}: parameters[{name!r}] must be an object with exactly "
+                f"the keys value, units, uncertainty; got {entry!r}"
+            )
+        if not isinstance(entry["value"], str):
+            raise SchemaError(
+                f"{where}: parameters[{name!r}].value must be a string (never a "
+                f"JSON number), got {entry['value']!r}"
+            )
+        facts[name] = ParameterFact(
+            value=entry["value"],
+            units=_str_or_none(entry["units"], f"parameters[{name!r}].units", where),
+            uncertainty=_str_or_none(
+                entry["uncertainty"], f"parameters[{name!r}].uncertainty", where
+            ),
+        )
+    return facts
+
+
+def _keyed_object(meta, key, where) -> dict[str, Any]:
+    raw = _require(meta, key, where)
+    if not isinstance(raw, dict):
+        raise SchemaError(f"{where}: {key!r} must be a JSON object keyed by data set")
+    return raw
+
+
+def _residual_centering(meta, where) -> dict[str, ResidualCentering]:
+    raw = _keyed_object(meta, "residual_centering", where)
+    out = {}
+    fields = (
+        "stored_residuals",
+        "stored_weighted",
+        "standard_output",
+        "standard_weighted",
     )
-    return Path(path)
+    for key, entry in raw.items():
+        if not isinstance(entry, dict) or any(f not in entry for f in fields):
+            raise SchemaError(
+                f"{where}: residual_centering[{key!r}] must be an object with "
+                f"the keys {fields}; got {entry!r}"
+            )
+        # An out-of-contract value is a RecordError here (R-4.1.1).
+        out[key] = ResidualCentering(**{f: entry[f] for f in fields})
+    return out
+
+
+def _columns(table: pa.Table, where: str):
+    names = table.column_names
+    present = set(names)
+    for name in SCALAR_COLUMNS:
+        if name not in present:
+            raise SchemaError(f"{where}: required column {name!r} is missing")
+
+    def column(name):
+        return table[name].to_numpy()
+
+    scalars = {name: column(name) for name in FLOAT_COLUMNS}
+    scalars["backend_flags"] = column("backend_flags").astype("U")
+    scalars["telescope"] = column("telescope").astype("U")
+
+    vectors: dict[str, dict[int, np.ndarray]] = {v: {} for v in VECTOR_COLUMNS}
+    tensors: dict[str, dict[tuple[int, int], np.ndarray]] = {
+        t: {} for t in TENSOR_COLUMNS
+    }
+    flags: dict[str, np.ndarray] = {}
+    for name in names:
+        if name in SCALAR_COLUMNS:
+            continue
+        if name.startswith(FLAG_PREFIX):
+            flags[name[len(FLAG_PREFIX) :]] = column(name).astype("U")
+            continue
+        m = _VECTOR_RE.match(name)
+        if m:
+            vectors[m.group(1)][int(m.group(2))] = column(name)
+            continue
+        m = _TENSOR_RE.match(name)
+        if m:
+            tensors[m.group(1)][(int(m.group(2)), int(m.group(3)))] = column(name)
+            continue
+        if name.startswith(VECTOR_COLUMNS + TENSOR_COLUMNS):
+            raise SchemaError(
+                f"{where}: column {name!r} uses a reserved prefix but is not a "
+                "block column; Enterprise would misread it"
+            )
+        # any other column is not part of the schema and is ignored
+
+    n = len(scalars["toas"])
+    arrays = dict(scalars)
+    for vname, cols in vectors.items():
+        k = len(cols)
+        if sorted(cols) != list(range(k)):
+            raise SchemaError(
+                f"{where}: {vname} block columns are not {vname}_0..{vname}_{k - 1}: "
+                f"{sorted(cols)}"
+            )
+        arrays[vname] = (
+            np.stack([cols[i] for i in range(k)], axis=1) if k else np.empty((n, 0))
+        )
+    for tname, cols in tensors.items():
+        if not cols:
+            raise SchemaError(f"{where}: no {tname} block columns")
+        ni = max(i for i, _ in cols) + 1
+        nj = max(j for _, j in cols) + 1
+        expected = {(i, j) for i in range(ni) for j in range(nj)}
+        if set(cols) != expected:
+            raise SchemaError(f"{where}: {tname} block columns are not a full grid")
+        arrays[tname] = np.stack(
+            [np.stack([cols[(i, j)] for j in range(nj)], axis=1) for i in range(ni)],
+            axis=1,
+        )
+    return arrays, flags
 
 
 def read(path) -> PulsarData:
-    """Read a schema-v1 feather back into a record, losslessly."""
-    import pyarrow.feather
+    """Rebuild the record written at ``path``.
 
-    table = pyarrow.feather.read_table(str(path))
-    names = table.column_names
-    columns = {name: table[name].to_numpy() for name in _COLUMNS}
+    Refuses a missing or unknown schema (R-6.2.2) and malformed psrdata
+    metadata as ``SchemaError``; a structurally invalid record, including an
+    out-of-contract residual centering, as ``RecordError``.
+    """
+    where = str(path)
+    table = pa_feather.read_table(where)
+    meta = _checked_metadata(table, where)
+    arrays, flags = _columns(table, where)
 
-    def block(prefix, width):
-        return np.stack(
-            [table[f"{prefix}_{i}"].to_numpy() for i in range(width)], axis=1
-        )
+    for key in ENTERPRISE_KEYS + PSRDATA_KEYS:
+        _require(meta, key, where)
+    pdist = meta["pdist"]
+    try:
+        pdist = (float(pdist[0]), float(pdist[1]))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise SchemaError(f"{where}: 'pdist' must be a pair of numbers") from exc
+    for key in ("producer", "name"):
+        if not isinstance(meta[key], str):
+            raise SchemaError(f"{where}: {key!r} must be a string")
+    if not isinstance(meta["extra"], dict):
+        raise SchemaError(f"{where}: 'extra' must be a JSON object")
 
-    n_fit = sum(1 for name in names if name.startswith("Mmat_"))
-    vectors = {
-        "Mmat": block("Mmat", n_fit),
-        "sunssb": block("sunssb", 6),
-        "pos_t": block("pos_t", 3),
-    }
-    planetssb = np.stack(
-        [
-            np.stack([table[f"planetssb_{i}_{j}"].to_numpy() for j in range(6)], axis=1)
-            for i in range(9)
-        ],
-        axis=1,
-    )
-    flags = {
-        name[len("flags_") :]: table[name].to_numpy().astype(str)
-        for name in names
-        if name.startswith("flags_")
-    }
-    meta = json.loads(table.schema.metadata[b"json"])
-    if meta.get("schema") != SCHEMA:
-        raise ValueError(f"{path}: schema {meta.get('schema')!r}, expected {SCHEMA!r}")
     return PulsarData(
         name=meta["name"],
-        fitpars=tuple(meta["fitpars"]),
         setpars=tuple(meta["setpars"]),
+        fitpars=tuple(meta["fitpars"]),
+        parameters=_parameters(meta, where),
         flags=flags,
-        pos=np.asarray(meta["pos"], dtype=float),
-        theta=float(meta["theta"]),
-        phi=float(meta["phi"]),
-        pdist=tuple(meta["pdist"]),
-        dm=float(meta["dm"]),
+        pos=np.asarray(meta["pos"], dtype=np.float64),
+        theta=meta["theta"],
+        phi=meta["phi"],
+        pdist=pdist,
+        dm=meta["dm"],
         dmx=meta["dmx"],
-        state_id=meta["state_id"],
-        software=meta["software"],
-        timing_package=meta["timing_package"],
-        gauge=meta["gauge"],
-        reference_theta_exact=meta["reference_theta_exact"],
-        native_units=meta["native_units"],
-        extra=meta.get("extra", {}),
-        schema=meta["schema"],
-        planetssb=planetssb,
-        **columns,
-        **vectors,
+        timing_package=_keyed_object(meta, "timing_package", where),
+        partim_compatibility=_keyed_object(meta, "partim_compatibility", where),
+        residual_centering=_residual_centering(meta, where),
+        producer=meta["producer"],
+        extra=meta["extra"],
+        **arrays,
     )
 
 
-__all__ = ["write", "read"]
+__all__ = ["SCHEMA", "write", "read", "read_metadata"]

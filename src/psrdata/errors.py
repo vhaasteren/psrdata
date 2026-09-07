@@ -1,13 +1,26 @@
-"""Errors raised by this package."""
+"""The public psrdata error categories (SPEC §14).
+
+All four derive from ``ValueError``, so a caller that catches the spec's
+category catches the Python category too.
+"""
 
 from __future__ import annotations
 
 
-class ParTextError(ValueError):
-    """A par file's *text* is malformed in a way no reader can resolve.
+class RecordError(ValueError):
+    """Invalid record shapes, parameter coverage, mappings or phase-offset columns."""
 
-    Raised by :mod:`psrdata.partext` only. It is a text error, never a physics
-    one: two active ``UNITS`` lines, a non-repeatable parameter given twice
-    with different values. Callers wrap it in whatever their own ingest layer
-    raises.
-    """
+
+class SchemaError(ValueError):
+    """Missing, malformed or unsupported psrdata schema metadata."""
+
+
+class LinearEngineError(ValueError):
+    """An invalid delta or an impossible linear decomposition."""
+
+
+class ParTextError(ValueError):
+    """Malformed par text handled by :mod:`psrdata.partext`."""
+
+
+__all__ = ["RecordError", "SchemaError", "LinearEngineError", "ParTextError"]

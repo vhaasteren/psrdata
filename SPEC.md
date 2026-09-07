@@ -166,11 +166,16 @@ MetaPulsar combination without inspecting `extra`.
 - every `fitpar` occurs in `setpars`;
 - every `setpar` has one entry in `parameters`;
 - a producer-created fit parameter such as `Offset` or `PHOFF` is also added
-  to `setpars` and `parameters`, with `value="0"`, no `uncertainty`, and the
-  unit of its column's delta: `"s"` for `Offset` (a time offset, so its
-  column is dimensionless) and `"dimensionless"` for `PHOFF` (a phase offset
-  in turns, so its column is seconds per turn); a suffixed form takes the
-  unit of its bare name;
+  to `setpars` and `parameters`. Its `value` is a decimal representation of
+  exactly zero (the token need not be `"0"`: `"0.0"` and other exact-zero
+  decimals are accepted and stored as written), it has no `uncertainty`, and
+  it uses the unit of its column's delta: `"s"` for `Offset` (a time offset,
+  so its column is dimensionless) and `"dimensionless"` for `PHOFF` (a phase
+  offset in turns, so its column is seconds per turn); a suffixed form takes
+  the unit of its bare name. This zero/units/no-uncertainty check applies to
+  phase-offset names in `fitpars`. A frozen `Offset` or `PHOFF` that appears
+  only in `setpars` is a model parameter, not the §3.6 column, and is not
+  required to be zero;
 - a producer may not put two matrix columns under the same fit-parameter name.
 
 **R-3.2.3 (mapping keys, enforced by psrdata).** `timing_package`,
@@ -184,9 +189,19 @@ values. psrdata normalizes them to one-entry mappings under the reserved key
 **R-3.2.4 (flags, enforced by psrdata).** Flag keys are nonempty strings and
 flag values are strings.
 
-**R-3.2.5 (linear values, enforced by psrdata).** `Mmat` and `residuals` are
-finite. `freqs` may contain `inf`. `planetssb` and unused velocity columns may
-contain `NaN`.
+**R-3.2.5 (finite values, enforced by psrdata).** Every numeric field is
+finite, with these exceptions:
+
+- `freqs` may contain `+inf` where no frequency was reported; `NaN` and
+  `-inf` are refused, so there is one missing-frequency sentinel;
+- `planetssb` may contain `NaN` for missing planet positions and unused
+  velocity entries;
+- unused Sun velocity columns (`sunssb` columns 3–5) may contain `NaN`.
+
+`Mmat`, `residuals`, `toas`, `stoas`, `toaerrs`, `pos`, `pos_t`, Sun
+position (`sunssb` columns 0–2), `theta`, `phi`, `dm` and both entries of
+`pdist` are finite. `±inf` is not an allowed missing-value encoding outside
+`freqs`.
 
 ### 3.3 `ParameterFact` and PINT units
 
@@ -229,6 +244,17 @@ coordinates. No separate fitted/frozen field is stored.
 
 - `reference_theta_exact()` from `parameters[name].value` in fitpar order;
 - `native_units` from `parameters[name].units` in fitpar order.
+
+Both are mappings keyed by fit-parameter name whose insertion order is
+fitpar order.
+
+`reference_theta()` is a derived float64 array of those decimal values,
+each entry the correctly rounded value of the decimal string with no
+intermediate float round trip. float64 is not the authority for a
+parameter such as `F0`, whose decimal needs more digits than a float64
+mantissa; a consumer that needs the recorded precision reads
+`reference_theta_exact()` (or the facts). The linear calculation itself
+is float64 because `Mmat` is float64.
 
 The names are retained on the engine only because nltiming's timing-engine
 interface uses them. The record does not duplicate these mappings.
@@ -483,14 +509,18 @@ They return the complete linear calculation over the record's matrix.
 
 **R-5.2.1.** `fitpars` is the record's fitpar tuple.
 
-**R-5.2.2.** `native_units` is derived from each fit parameter's PINT unit.
-The attribute keeps nltiming's established name; its contents are always PINT
-units.
+**R-5.2.2.** `native_units` is a mapping from each fit parameter to its PINT
+unit, keyed in fitpar order. The attribute keeps nltiming's established
+name; its contents are always PINT units.
 
-**R-5.2.3.** `reference_theta_exact()` is derived from fit-parameter values.
+**R-5.2.3.** `reference_theta_exact()` is a mapping from each fit parameter
+to its decimal `ParameterFact.value` string, keyed in fitpar order. This is
+the authority for the recorded reference.
 
-**R-5.2.4.** `reference_theta()` parses those decimal values without an
-intermediate float round trip.
+**R-5.2.4.** `reference_theta()` is a float64 array in fitpar order. Each
+entry is the correctly rounded value of the corresponding decimal string,
+with no intermediate float round trip. It is a derived view for float64
+linear algebra, not a second stored reference.
 
 **R-5.2.5.** `residual_delta(δ)` returns `-Mmat @ δ` and rejects the wrong
 delta shape.
@@ -604,8 +634,8 @@ never JSON numbers, so that no float round trip occurs in the codec.
 ### 6.3 Round trip and consumers
 
 **R-6.3.1.** A psrdata record survives write/read field by field, including
-parameter facts, per-data-set mappings, `inf` frequencies, permitted `NaN`
-planet slots and flags.
+parameter facts, per-data-set mappings, `+inf` frequencies, permitted `NaN`
+planet slots and unused velocity entries, and flags.
 
 **R-6.3.2.** Stock Enterprise and Discovery readers read psrdata-written
 files without importing psrdata or understanding its additive metadata.

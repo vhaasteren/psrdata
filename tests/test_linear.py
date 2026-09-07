@@ -1,283 +1,349 @@
-"""The record's own linear engine, single-leg and composite; no timing package.
-
-The engine is ``-Mmat @ delta`` over the record's matrix. A composite record
-declares no partition: a leg's rows are the support of its named gauge
-column, and the parameters it owns are the columns nonzero on those rows.
-The ``consumers`` tests at the end run nltiming's own protocol checks and
-its gauge check against the engine, which is how conformance to a protocol
-this package does not import is asserted.
-"""
+"""The record's linear engine: SPEC §3.6, §5 (test obligations 4, 7, 8, 13)."""
 
 from __future__ import annotations
 
-import dataclasses
+import subprocess
+import sys
+from decimal import Decimal
 
 import numpy as np
 import pytest
 
+import psrdata
+from conftest import (
+    COMBINED_FITPARS,
+    COMBINED_KEYS,
+    SINGLE_FITPARS,
+    SINGLE_SETPARS,
+    combined_kwargs,
+    make_combined,
+    make_record,
+    record_kwargs,
+)
 from psrdata import (
-    GaugeProvenance,
-    LinearContribution,
-    LinearModel,
+    LinearEngineError,
     LinearTimingEngine,
+    ParameterFact,
     PulsarData,
-    RecordLinearTimingEngine,
+    linear_engine,
 )
 
-_GAUGE_FREE = {
-    "export": "none",
-    "reference_mode": "none",
-    "reporting_mode": "mean",
-    "reporting_weighted": True,
-}
+# --- §5.1 construction --------------------------------------------------------
 
 
-def _with_matrix(record, fitpars, design, *, gauge, timing_package):
-    """The fixture record with a different matrix, fitpars and gauge."""
-    n = design.shape[0]
-    rng = np.random.default_rng(1)
-    planetssb = np.full((n, 9, 6), np.nan)
-    return dataclasses.replace(
-        record,
-        fitpars=tuple(fitpars),
-        toas=np.linspace(5e9, 5e9 + 6e8, n),
-        stoas=np.linspace(5e9, 5e9 + 6e8, n),
-        toaerrs=np.full(n, 1e-6),
-        residuals=rng.normal(size=n) * 1e-6,
-        freqs=np.full(n, 1400.0),
-        Mmat=np.asarray(design, dtype=float),
-        flags={},
-        backend_flags=np.array([""] * n),
-        telescope=np.array(["ao"] * n),
-        pos_t=np.tile([0.6, 0.8, 0.0], (n, 1)),
-        sunssb=np.zeros((n, 6)),
-        planetssb=planetssb,
-        timing_package=timing_package,
-        gauge=gauge,
-        reference_theta_exact={name: "1.0" for name in fitpars},
-        native_units={name: "native" for name in fitpars},
-    )
+def test_the_four_entry_points_agree(record, tmp_path):
+    path = tmp_path / "r.feather"
+    psrdata.feather.write(record, path)
+    engines = [
+        record.linear_engine(),
+        linear_engine(record),
+        LinearTimingEngine.from_pulsar_data(record),
+        LinearTimingEngine.from_feather(path),
+    ]
+    delta = np.arange(len(record.fitpars), dtype=float)
+    for engine in engines:
+        assert isinstance(engine, LinearTimingEngine)
+        assert engine.fitpars == record.fitpars
+        assert np.allclose(engine.residual_delta(delta), -record.Mmat @ delta)
 
 
-@pytest.fixture
-def composite(record):
-    """Two legs, one shared F0, one local parameter each, per-leg offsets."""
-    n_epta, n_ppta = 6, 4
-    n = n_epta + n_ppta
-    epta = np.arange(n_epta)
-    ppta = np.arange(n_epta, n)
-    fitpars = ("F0", "F1_epta", "Offset_epta", "Offset_ppta", "JUMP1_ppta")
-    M = np.zeros((n, len(fitpars)))
-    M[:, 0] = np.linspace(1.0, 2.0, n)
-    M[epta, 1] = np.linspace(0.1, 0.5, n_epta)
-    M[epta, 2] = 1.0
-    M[ppta, 3] = 1.0
-    M[ppta, 4] = 1.0
-    gauge = {
-        "epta": dict(_GAUGE_FREE),
-        "ppta": {**_GAUGE_FREE, "reporting_weighted": False},
+# --- §5.2 required behaviour --------------------------------------------------
+
+
+def test_fitpars_units_and_references_come_from_the_facts(record):
+    engine = record.linear_engine()
+    assert engine.fitpars == SINGLE_FITPARS
+    assert engine.native_units == {
+        name: record.parameters[name].units for name in SINGLE_FITPARS
     }
-    return _with_matrix(record, fitpars, M, gauge=gauge, timing_package="composite")
+    assert tuple(engine.native_units) == SINGLE_FITPARS
+    assert engine.reference_theta_exact() == {
+        name: record.parameters[name].value for name in SINGLE_FITPARS
+    }
+    assert tuple(engine.reference_theta_exact()) == SINGLE_FITPARS
 
 
-@pytest.fixture
-def single(record):
-    """A vela-jax-like record: the PHOFF column is 1/F(t), drifting 1e-7."""
-    n = 24
-    phoff = 1.0 / (300.0 * (1.0 + 1e-7 * np.linspace(0.0, 1.0, n)))
-    M = np.column_stack([np.linspace(1.0, 2.0, n), phoff])
-    return _with_matrix(
-        record, ("F0", "PHOFF"), M, gauge=dict(_GAUGE_FREE), timing_package="pint"
-    )
+def test_reference_theta_parses_decimals_without_a_float_round_trip():
+    """R-5.2.4 / R-3.3.5: the float64 view is the correctly rounded value of
+    the decimal string; the exact mapping keeps digits float64 cannot."""
+    exact = "339.315687288152034567891234"
+    kwargs = record_kwargs()
+    parameters = dict(kwargs["parameters"])
+    parameters["F0"] = ParameterFact(exact, "Hz")
+    engine = make_record(parameters=parameters).linear_engine()
+    theta = engine.reference_theta()
+    assert theta.dtype == np.float64
+    assert theta.shape == (len(SINGLE_FITPARS),)
+    assert theta[0] == float(Decimal(exact))
+    assert engine.reference_theta_exact()["F0"] == exact
+    assert str(theta[0]) != exact
 
 
-# --- the linear model ------------------------------------------------------
+def test_residual_delta_is_minus_mmat_delta(record):
+    engine = record.linear_engine()
+    delta = np.array([1e-9, 1e-20, 1e-7, 2e-6])
+    assert np.allclose(engine.residual_delta(delta), -record.Mmat @ delta)
+    assert engine.residual_delta(delta).shape == (len(record.toas),)
 
 
-def test_the_engine_is_minus_m_delta(single):
-    engine = single.linear_engine()
-    delta = np.array([1e-3, -2e-3])
-    np.testing.assert_allclose(engine.residual_delta(delta), -(single.Mmat @ delta))
-    np.testing.assert_array_equal(engine.design_matrix(), single.Mmat)
-    np.testing.assert_array_equal(engine.residual_jacobian(), -single.Mmat)
-    assert engine.residual_delta(np.zeros(2)).max() == 0.0
-    np.testing.assert_array_equal(engine.reference_theta(), [1.0, 1.0])
-    assert engine.reference_theta_exact() == {"F0": "1.0", "PHOFF": "1.0"}
+@pytest.mark.parametrize("shape", [(3,), (5,), (4, 1), (1, 4), (), (2, 2)])
+def test_the_wrong_delta_shape_is_refused(record, shape):
+    engine = record.linear_engine()
+    with pytest.raises(LinearEngineError):
+        engine.residual_delta(np.zeros(shape))
 
 
-def test_the_reference_is_parsed_exactly():
-    model = LinearModel.from_design(
-        fitpars=("F0",),
-        design=np.ones((3, 1)),
-        theta_exact={"F0": "339.31568728824099254"},
-    )
-    assert model.reference_theta()[0] == float("339.31568728824099254")
+def test_design_matrix_accepts_only_params_none(record):
+    engine = record.linear_engine()
+    assert engine.design_matrix() is record.Mmat
+    assert engine.design_matrix(params=None) is record.Mmat
+    with pytest.raises(LinearEngineError):
+        engine.design_matrix(params={"F0": 1.0})
+    with pytest.raises(LinearEngineError):
+        engine.design_matrix(np.zeros(4))
 
 
-def test_a_wrong_length_delta_is_refused(single):
-    with pytest.raises(ValueError, match="shape mismatch"):
-        single.linear_engine().residual_delta(np.zeros(3))
+def test_residual_jacobian_is_minus_mmat(record):
+    engine = record.linear_engine()
+    assert np.array_equal(engine.residual_jacobian(), -record.Mmat)
 
 
-def test_every_optional_hook_has_its_linear_answer(single):
-    engine = single.linear_engine()
-    assert engine.identically_linear_fitpars() == frozenset(single.fitpars)
+def test_every_fit_parameter_is_identically_linear(record):
+    engine = record.linear_engine()
+    assert tuple(engine.identically_linear_fitpars()) == record.fitpars
+
+
+def test_no_nonlinear_surface(record):
+    engine = record.linear_engine()
     assert engine.nonlinear_params is None
-    assert engine.binary_chart_capability("kepler_laplace", "") is None
-    assert engine.contributions is None
-    assert engine.gauge_applied is False
-    assert engine.gauge_provenance() == GaugeProvenance(**_GAUGE_FREE)
+    assert engine.binary_chart_capability("ELL1") is None
+    assert engine.binary_chart_capability() is None
+    assert engine.engine_name == "linear"
+    assert engine.timing_package == {"single": "tempo2"}
+    assert engine.partim_compatibility == {"single": "tempo2"}
 
 
-# --- the gauge direction is the record's own column -------------------------
-
-
-def test_a_single_leg_record_declares_its_gauge_column(single):
-    engine = single.linear_engine()
-    assert isinstance(engine, RecordLinearTimingEngine)
-    assert engine.gauge_column == "PHOFF"
-    np.testing.assert_array_equal(engine.gauge_direction(), single.Mmat[:, 1])
-
-
-def test_a_record_without_a_named_gauge_column_is_refused(record):
-    M = np.column_stack([np.linspace(1.0, 2.0, 5), np.ones(5)])
-    broken = _with_matrix(
-        record, ("F0", "DM"), M, gauge=dict(_GAUGE_FREE), timing_package="pint"
+def test_the_engine_imports_no_jax():
+    code = (
+        "import sys, psrdata.linear, psrdata.feather, psrdata.record; "
+        "assert not [m for m in sys.modules if m == 'jax' or m.startswith('jax.')]"
     )
-    with pytest.raises(ValueError, match="exactly one named gauge column"):
-        broken.linear_engine()
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_two_gauge_columns_are_refused(record):
-    M = np.ones((5, 3))
-    broken = _with_matrix(
-        record,
-        ("F0", "Offset", "PHOFF"),
-        M,
-        gauge=dict(_GAUGE_FREE),
-        timing_package="pint",
+# --- obligation 4: PINT-unit matrix calculations -------------------------------
+
+
+def test_matrix_columns_are_seconds_per_pint_unit(record):
+    """Column j is s per ``parameters[fitpars[j]].units``: a unit delta on
+    coordinate j moves the residuals by minus that column, and the unit label
+    the engine reports for j is the fact's PINT unit, not a heuristic."""
+    engine = record.linear_engine()
+    p = len(record.fitpars)
+    for j, name in enumerate(record.fitpars):
+        e_j = np.zeros(p)
+        e_j[j] = 1.0
+        assert np.array_equal(engine.residual_delta(e_j), -record.Mmat[:, j])
+    assert engine.native_units["F0"] == "Hz"
+    assert engine.native_units["F1"] == "Hz / s"
+    assert engine.native_units["RAJ"] == "hourangle"
+    assert engine.native_units["Offset"] == "s"
+
+
+# --- §3.6 phase-offset columns ------------------------------------------------
+
+
+def _single_with_offsets(names, units):
+    """A single-data-set record whose phase-offset fit parameters are ``names``."""
+    kwargs = record_kwargs()
+    base_fit = tuple(p for p in SINGLE_FITPARS if p != "Offset")
+    base_set = tuple(p for p in SINGLE_SETPARS if p != "Offset")
+    parameters = {k: v for k, v in kwargs["parameters"].items() if k != "Offset"}
+    Mmat = kwargs["Mmat"][:, :-1]
+    for name, unit in zip(names, units):
+        parameters[name] = ParameterFact("0", unit)
+        Mmat = np.hstack([Mmat, np.ones((Mmat.shape[0], 1))])
+    kwargs.update(
+        fitpars=base_fit + tuple(names),
+        setpars=base_set + tuple(names),
+        parameters=parameters,
+        Mmat=Mmat,
     )
-    with pytest.raises(ValueError, match="exactly one named gauge column"):
-        broken.linear_engine()
+    return PulsarData(**kwargs)
 
 
-# --- composite: the partition is in the matrix -------------------------------
+@pytest.mark.parametrize(
+    "name, unit",
+    [
+        ("Offset", "s"),
+        ("PHOFF", "dimensionless"),
+        ("Offset_single", "s"),
+        ("PHOFF_single", "dimensionless"),
+    ],
+)
+def test_a_single_data_set_may_use_a_bare_or_suffixed_name(name, unit):
+    engine = _single_with_offsets([name], [unit]).linear_engine()
+    (contribution,) = engine.contributions().values()
+    assert contribution.key == "single"
+    assert contribution.phase_offset == name
 
 
-def test_a_composite_record_is_its_own_linear_engine(composite):
-    engine = composite.linear_engine()
-    assert isinstance(engine, LinearTimingEngine)
-    delta = np.array([1e-3, 2e-3, -1e-3, 4e-3, 5e-3])
-    np.testing.assert_allclose(engine.residual_delta(delta), -(composite.Mmat @ delta))
-
-    by_name = {c.name: c for c in engine.contributions}
-    assert set(by_name) == {"epta", "ppta"}
-    assert all(isinstance(c, LinearContribution) for c in engine.contributions)
-    np.testing.assert_array_equal(by_name["epta"].row_indices, np.arange(6))
-    np.testing.assert_array_equal(by_name["ppta"].row_indices, np.arange(6, 10))
-    # Ownership is read off the matrix: nonzero on the leg's rows.
-    assert by_name["epta"].engine.fitpars == ("F0", "F1_epta", "Offset_epta")
-    assert by_name["ppta"].engine.fitpars == ("F0", "Offset_ppta", "JUMP1_ppta")
-    assert by_name["epta"].engine.gauge_column == "Offset_epta"
-    np.testing.assert_array_equal(by_name["ppta"].engine.gauge_direction(), np.ones(4))
+def test_no_phase_offset_column_is_refused():
+    rec = _single_with_offsets([], [])
+    with pytest.raises(LinearEngineError, match="phase-offset"):
+        rec.linear_engine()
 
 
-def test_a_composite_has_one_provenance_per_leg_and_none_of_its_own(composite):
-    engine = composite.linear_engine()
-    by_name = {c.name: c.engine.gauge_provenance() for c in engine.contributions}
-    assert by_name["epta"].reporting_weighted is True
-    assert by_name["ppta"].reporting_weighted is False
-    with pytest.raises(AttributeError, match="per contribution"):
-        engine.gauge_provenance()
-    assert engine.gauge_applied is False
+@pytest.mark.parametrize(
+    "names, units",
+    [
+        (("Offset", "PHOFF"), ("s", "dimensionless")),
+        (("Offset", "Offset_single"), ("s", "s")),
+        (("PHOFF", "PHOFF_single"), ("dimensionless", "dimensionless")),
+    ],
+)
+def test_two_candidates_for_one_data_set_are_refused(names, units):
+    rec = _single_with_offsets(names, units)
+    with pytest.raises(LinearEngineError, match="phase-offset"):
+        rec.linear_engine()
 
 
-def test_a_leaf_is_the_block_of_the_whole(composite):
-    engine = composite.linear_engine()
-    delta = np.array([1e-3, 2e-3, -1e-3, 4e-3, 5e-3])
-    whole = engine.residual_delta(delta)
-    for contribution in engine.contributions:
-        leaf = contribution.engine
-        idx = [composite.fitpars.index(name) for name in leaf.fitpars]
-        np.testing.assert_allclose(
-            leaf.residual_delta(delta[idx]), whole[contribution.row_indices]
-        )
-
-
-def test_a_leg_without_its_own_gauge_column_is_refused(composite):
-    fitpars = tuple(
-        name.replace("Offset_ppta", "Offset_other") for name in composite.fitpars
-    )
-    broken = dataclasses.replace(
-        composite,
+def test_a_combined_record_never_uses_a_bare_name():
+    kwargs, _ = combined_kwargs()
+    fitpars = tuple("Offset" if p == "Offset_EPTA_DR2" else p for p in COMBINED_FITPARS)
+    parameters = dict(kwargs["parameters"])
+    parameters["Offset"] = parameters.pop("Offset_EPTA_DR2")
+    rec = make_combined(
         fitpars=fitpars,
-        reference_theta_exact={name: "1.0" for name in fitpars},
-        native_units={name: "native" for name in fitpars},
+        setpars=fitpars + ("PB", "PSR"),
+        parameters=parameters,
     )
-    with pytest.raises(ValueError, match="leg 'ppta' must carry exactly one"):
-        broken.linear_engine()
+    with pytest.raises(LinearEngineError, match="EPTA_DR2"):
+        rec.linear_engine()
 
 
-def test_legs_whose_gauge_columns_overlap_are_refused(composite):
-    M = np.array(composite.Mmat)
-    M[:, 3] = 1.0  # Offset_ppta now claims every row
-    with pytest.raises(ValueError, match="partition the rows"):
-        dataclasses.replace(composite, Mmat=M).linear_engine()
-
-
-def test_a_zero_gauge_column_is_refused(composite):
-    M = np.array(composite.Mmat)
-    M[:, 3] = 0.0
-    with pytest.raises(ValueError, match="numerically zero"):
-        dataclasses.replace(composite, Mmat=M).linear_engine()
-
-
-def test_the_engine_survives_the_feather(composite, tmp_path):
-    path = composite.to_feather(tmp_path / "composite.feather")
-    engine = LinearTimingEngine.from_feather(path)
-    by_name = {c.name: c for c in engine.contributions}
-    np.testing.assert_array_equal(by_name["epta"].row_indices, np.arange(6))
-    delta = np.ones(len(composite.fitpars)) * 1e-3
-    np.testing.assert_allclose(engine.residual_delta(delta), -(composite.Mmat @ delta))
-    assert LinearTimingEngine.from_pulsar_data(
-        PulsarData.from_feather(path)
-    ).fitpars == (composite.fitpars)
-
-
-# --- conformance to the consumer's protocol, asserted by the consumer ---------
-
-
-@pytest.mark.consumers
-def test_nltiming_accepts_it_as_a_timing_engine(single, composite):
-    """Structural conformance, checked with nltiming's own protocols."""
-    protocols = pytest.importorskip("nltiming.protocols")
-    for record in (single, composite):
-        engine = record.linear_engine()
-        assert isinstance(engine, protocols.TimingEngine)
-        assert isinstance(engine, protocols.JacobianTimingEngine)
-        assert not isinstance(engine, protocols.JaxTimingEngine)
-        for contribution in engine.contributions or ():
-            assert isinstance(contribution.engine, protocols.JacobianTimingEngine)
-
-
-@pytest.mark.consumers
-def test_nltiming_gauge_check_passes_and_reads_one_provenance_per_leg(
-    single, composite
-):
-    ntm = pytest.importorskip("nltiming.nonlinear_timing_model")
-    for record in (single, composite):
-        engine = record.linear_engine()
-        ntm.assert_gauge_column_present(record, engine, np.asarray(record.Mmat))
-    provenance = dict(
-        ntm._normalize_gauge_provenance(composite, composite.linear_engine())
+def test_a_combined_record_with_both_forms_for_one_key_is_refused():
+    kwargs, _ = combined_kwargs()
+    Mmat = np.hstack([kwargs["Mmat"], kwargs["Mmat"][:, 2:3]])
+    parameters = dict(kwargs["parameters"])
+    parameters["PHOFF_EPTA_DR2"] = ParameterFact("0", "dimensionless")
+    rec = make_combined(
+        fitpars=COMBINED_FITPARS + ("PHOFF_EPTA_DR2",),
+        setpars=COMBINED_FITPARS + ("PHOFF_EPTA_DR2", "PB", "PSR"),
+        parameters=parameters,
+        Mmat=Mmat,
     )
-    assert set(provenance) == {"epta", "ppta"}
+    with pytest.raises(LinearEngineError, match="EPTA_DR2"):
+        rec.linear_engine()
 
-    # The declared direction is what closes the high-F1 case: the same
-    # matrix under an engine that declares nothing is held to the constant.
-    silent = LinearTimingEngine(
-        LinearModel.from_design(fitpars=single.fitpars, design=single.Mmat),
-        gauge_provenance=GaugeProvenance(**_GAUGE_FREE),
-    )
-    with pytest.raises(ntm.GaugeColumnMissingError, match="constant direction"):
-        ntm.assert_gauge_column_present(single, silent, np.asarray(single.Mmat))
+
+def test_overlapping_supports_are_refused():
+    kwargs, membership = combined_kwargs()
+    Mmat = kwargs["Mmat"].copy()
+    row = int(np.flatnonzero(membership == 1)[0])
+    Mmat[row, COMBINED_FITPARS.index("Offset_EPTA_DR2")] = 1.0
+    with pytest.raises(LinearEngineError, match="partition"):
+        make_combined(Mmat=Mmat).linear_engine()
+
+
+def test_a_gap_in_the_supports_is_refused():
+    kwargs, membership = combined_kwargs()
+    Mmat = kwargs["Mmat"].copy()
+    row = int(np.flatnonzero(membership == 1)[0])
+    Mmat[row, COMBINED_FITPARS.index("PHOFF_PPTA_DR3")] = 0.0
+    with pytest.raises(LinearEngineError, match="partition"):
+        make_combined(Mmat=Mmat).linear_engine()
+
+
+def test_a_single_record_gap_is_refused():
+    kwargs = record_kwargs()
+    Mmat = kwargs["Mmat"].copy()
+    Mmat[4, SINGLE_FITPARS.index("Offset")] = 0.0
+    with pytest.raises(LinearEngineError, match="partition"):
+        make_record(Mmat=Mmat).linear_engine()
+
+
+# --- §5.3 per-data-set contributions -------------------------------------------
+
+
+def test_contributions_partition_the_rows(combined_membership):
+    rec, membership = combined_membership
+    contributions = rec.linear_engine().contributions()
+    assert tuple(contributions) == COMBINED_KEYS
+    for i, key in enumerate(COMBINED_KEYS):
+        assert np.array_equal(contributions[key].rows, np.flatnonzero(membership == i))
+    all_rows = np.concatenate([c.rows for c in contributions.values()])
+    assert np.array_equal(np.sort(all_rows), np.arange(len(rec.toas)))
+
+
+def test_a_contributions_fit_parameters_are_its_active_columns(combined):
+    contributions = combined.linear_engine().contributions()
+    epta = contributions["EPTA_DR2"]
+    ppta = contributions["PPTA_DR3"]
+    assert epta.fitpars == ("F0", "F1", "Offset_EPTA_DR2")
+    assert ppta.fitpars == ("F0", "F1", "DM_PPTA_DR3", "PHOFF_PPTA_DR3")
+    assert epta.phase_offset == "Offset_EPTA_DR2"
+    assert ppta.phase_offset == "PHOFF_PPTA_DR3"
+    for c in (epta, ppta):
+        assert tuple(c.identically_linear_fitpars()) == c.fitpars
+        assert tuple(c.linear_fitpars) == c.fitpars
+        assert c.design_matrix().shape == (len(c.rows), len(c.fitpars))
+        assert np.array_equal(
+            c.design_matrix(), combined.Mmat[np.ix_(c.rows, c.column_indices)]
+        )
+        assert tuple(c.native_units) == c.fitpars
+        assert tuple(c.reference_theta_exact()) == c.fitpars
+        assert c.engine_name == "linear"
+        assert c.nonlinear_params is None
+
+
+def test_contributions_reassemble_the_whole_product(combined):
+    """R-5.3.3."""
+    engine = combined.linear_engine()
+    rng = np.random.default_rng(7)
+    delta = rng.normal(size=len(combined.fitpars))
+    whole = engine.residual_delta(delta)
+    assembled = np.full_like(whole, np.nan)
+    for c in engine.contributions().values():
+        assembled[c.rows] = c.residual_delta(delta[list(c.column_indices)])
+    assert np.allclose(assembled, whole)
+    assert not np.isnan(assembled).any()
+
+
+def test_a_single_record_has_one_contribution_over_every_row(record):
+    engine = record.linear_engine()
+    (c,) = engine.contributions().values()
+    assert np.array_equal(c.rows, np.arange(len(record.toas)))
+    assert c.fitpars == record.fitpars
+    assert np.array_equal(c.design_matrix(), record.Mmat)
+
+
+def test_residual_centering_is_a_mapping_for_one_or_several(record, combined):
+    """R-5.3.4: nothing raises merely because there are several data sets."""
+    single = record.linear_engine()
+    assert tuple(single.residual_centering) == ("single",)
+    several = combined.linear_engine()
+    assert tuple(several.residual_centering) == COMBINED_KEYS
+    for key, c in several.contributions().items():
+        assert c.residual_centering == combined.residual_centering[key]
+        assert c.timing_package == combined.timing_package[key]
+        assert c.partim_compatibility == combined.partim_compatibility[key]
+
+
+# --- obligation 13: mixed compatibilities in PINT-unit coordinates ------------
+
+
+def test_mixed_pint_and_tempo2_data_sets_share_one_pint_unit_coordinate(combined):
+    """A PINT-read and a tempo2-read data set meet in one global column whose
+    unit is the fact's PINT unit; each contribution reports that same unit and
+    the same reference value for the shared parameter."""
+    assert combined.partim_compatibility == {"EPTA_DR2": "pint", "PPTA_DR3": "tempo2"}
+    engine = combined.linear_engine()
+    assert engine.native_units["F0"] == "Hz"
+    for c in engine.contributions().values():
+        assert c.native_units["F0"] == "Hz"
+        assert c.reference_theta_exact()["F0"] == combined.parameters["F0"].value
+    j = combined.fitpars.index("F0")
+    e = np.zeros(len(combined.fitpars))
+    e[j] = 1e-9
+    assert np.allclose(engine.residual_delta(e), -1e-9 * combined.Mmat[:, j])
