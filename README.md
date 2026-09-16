@@ -1,5 +1,7 @@
 # psrdata
 
+**This repository has moved to [nanograv/psrdata](https://github.com/nanograv/psrdata).**
+
 **The frozen pulsar-data record, its on-disk schema, its own linear engine,
 and the pure par-text rules** — the layer every pulsar-timing package in this
 stack agrees on, and the only one none of them owns.
