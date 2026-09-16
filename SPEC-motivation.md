@@ -8,13 +8,12 @@ their present shape.
 
 ## 1. Why this package exists
 
-Three separate concerns were previously conflated:
+Three separate concerns meet at this boundary:
 
 1. **A timing-engine interface.** nltiming states which operations it needs,
    and timing software implements those operations structurally.
-2. **A file layout.** Enterprise originated the Feather column layout and
-   Discovery implemented a compatible reader. A layout needs a written
-   specification and compatibility tests.
+2. **A file layout.** Enterprise and Discovery consume the same Feather column
+   layout. A layout needs a written specification and compatibility tests.
 3. **Shared implementation.** MetaPulsar, vela-jax and nltiming need the same
    materialized record, metadata codec, linear matrix calculation and par-text
    rules, but none is an appropriate dependency of the other two.
@@ -24,10 +23,10 @@ Only the third concern requires `psrdata` as a package.
 `psrdata` therefore does not own the general pulsar abstraction or the live
 timing-engine protocols. It owns the concrete data product shared at the
 boundary: the record, its Feather representation, the values needed to
-interpret it and the linear calculation already contained in its matrix.
+interpret it and the linear calculation defined by its matrix.
 
-This is intentionally a modest purpose. It is enough to remove duplicated code
-without turning psrdata into the vocabulary layer for the entire PTA stack.
+This is intentionally a modest purpose. It centralizes shared code without
+turning psrdata into the vocabulary layer for the entire PTA stack.
 
 ---
 
@@ -42,14 +41,13 @@ their basic construction paths:
 
 Shared code therefore needs a location below all three.
 
-The NumPy/PyArrow dependency floor keeps that location honest. It is not a
-claim that current installations avoid PINT—the present ecosystem generally
-installs it. It means the materialized record and `-Mmat @ delta` do not
-themselves acquire timing-software dependencies.
+The NumPy/PyArrow dependency floor keeps that location honest. It does not
+require an installation to avoid PINT; it ensures that the materialized record
+and `-Mmat @ delta` do not themselves acquire timing-software dependencies.
 
 Enterprise and Discovery are deliberately not required to import psrdata.
 Their stock readers are compatibility authorities. A psrdata file is useful
-only if those readers continue to consume its established columns.
+only if those readers consume its specified columns.
 
 ---
 
@@ -66,7 +64,7 @@ Three objects are commonly called “the pulsar”:
 The record is not a reduced timing package. It is the result of one timing
 calculation at one reference model.
 
-The record nevertheless contains one complete callable calculation:
+The record nevertheless defines one complete callable calculation:
 
 ```text
 delta residual = -Mmat @ delta parameter
@@ -94,9 +92,9 @@ The pair must therefore agree on:
 - phase-offset columns;
 - reference matrix.
 
-This is the purpose of moving timing-package selection into MetaPulsar
-construction. Selecting a different timing package later would reopen the
-same ambiguity.
+Timing-package selection therefore occurs during MetaPulsar construction.
+Replacing that timing package after construction would create the same
+ambiguity.
 
 There is no additional requirement that repeated engine access return the
 same Python object. Scientific agreement of the record and calculation is the
@@ -106,15 +104,13 @@ contract.
 
 ## 4. No state fingerprint
 
-An earlier design gave every record a `state_id`. Its practical use was cache
-invalidation for mutable live pulsar objects, not interpretation of a
-materialized record.
-
-A record already contains the state needed for its linear calculation. It
+A record contains the state needed for its linear calculation. It
 does not change through normal use, and loading another record creates another
 object. A partial hash or readable token adds no scientific guarantee.
 
-`state_id` is therefore removed from psrdata:
+A `state_id` would serve cache invalidation for mutable live pulsar objects,
+not interpretation of a materialized record. It is excluded from psrdata
+because:
 
 - it is not a file-integrity checksum;
 - it is not proof that two calculations used the same external files;
@@ -205,9 +201,7 @@ not a syntax dialect.
 
 The question "is the reader ever not the calculator?" has a definite answer.
 For a pure PINT or pure tempo2/libstempo record the two are the same
-package, which is why they were long treated as synonyms. They differ in
-every engine that separates the two roles, and those engines are the reason
-the split exists:
+package. They differ in every engine that separates the two roles:
 
 | configuration | reads the files, forms the frozen inputs | calculates residuals and `Mmat` |
 |---|---|---|
@@ -224,11 +218,9 @@ So vela-jax can:
 - expose fit coordinates in PINT units.
 
 No single “timing package” string can communicate all three facts. This is
-also why MetaPulsar's existing use of the words "timing package", which
-means the reader, maps onto `partim_compatibility` unchanged: MetaPulsar
-chooses PINT or tempo2 to open a release and uses that package's reading.
-What MetaPulsar did not previously name is the calculator, which the new
-`timing_package` field supplies.
+why a MetaPulsar choice between PINT and tempo2 as the reader populates
+`partim_compatibility`, while the software that calculates the residual and
+matrix block populates `timing_package`.
 
 ### 6.2a Why the writer is recorded separately
 
@@ -237,15 +229,13 @@ third question. A MetaPulsar record's blocks were calculated by other
 packages and read under compatibilities MetaPulsar chose, but the
 combination, the parameter renaming, the unit conversion and the file were
 MetaPulsar's. A reader that sees `timing_package={"EPTA_DR2": "vela_jax",
-"PPTA_DR3": "vela_jax"}` cannot infer from that alone whether the record came
-from MetaPulsar or from a future combiner, and provenance of the combination
-step is exactly what a later reproduction needs. The earlier `software` field
-carried this; it is retained under the vocabulary's own word for it.
+"PPTA_DR3": "vela_jax"}` cannot infer from that alone which software combined
+the blocks. Reproduction therefore requires `producer` as a separate field.
 
 ### 6.3 Why both are mappings
 
 A single-data-set pulsar and a combined pulsar should have the same interface.
-MetaPulsar already has meaningful data-set names: they are the keys supplied
+MetaPulsar has meaningful data-set names: they are the keys supplied
 to `create_metapulsar()` or the direct `MetaPulsar` constructor. Those names
 flow through its per-PTA dictionaries and become names such as `"EPTA_DR2"` or
 `"PPTA_DR3"`.
@@ -281,7 +271,7 @@ residual_centering={"single": ResidualCentering(...)}
 would change if the same data were recalculated by JUG or vela-jax. That would
 incorrectly turn a software choice into data-set identity.
 
-When MetaPulsar combines records, it constructs new mappings using its existing
+When MetaPulsar combines records, it constructs mappings using its
 input keys. The standalone `"single"` key is not retained as a leg name.
 
 After normalization, the public shape is uniform: the mappings have one entry
@@ -294,11 +284,9 @@ may keep a bare `Offset` or `PHOFF`; it does not acquire an `Offset_single` or
 
 ## 7. PINT units are the ecosystem standard
 
-The record previously described units as native to whichever timing package
-calculated a leg. That leaves a combined fit coordinate ill-defined when one
-block comes from PINT-family calculations and another from tempo2/libstempo.
-
-The ecosystem instead adopts one rule:
+Package-native units would leave a combined fit coordinate ill-defined when
+one block comes from PINT-family calculations and another from
+tempo2/libstempo. The record therefore adopts one rule:
 
 > Every timing parameter, uncertainty, delta and design-matrix column in a
 > psrdata record uses PINT's default unit for that parameter.
@@ -308,11 +296,11 @@ calculation is physically correct.
 
 PINT has a developed parameter-unit model. tempo2 and libstempo do not expose
 equally transparent unit handling through their Python interface. Code that
-interacts with tempo2/libstempo must already know where conversions are
+interacts with tempo2/libstempo must know where conversions are
 required. The reliable place to perform them is at that boundary, before the
 record is created.
 
-MetaPulsar already follows this pattern for design-matrix columns, including
+MetaPulsar applies this pattern to design-matrix columns, including
 the angular-coordinate scalings where PINT and tempo2 expose different units.
 Making the rule universal prevents a consumer from having to infer a column's
 scale from the timing package name.
@@ -329,14 +317,14 @@ The combiner therefore:
 3. verifies the shared reference value;
 4. inserts every block into one global column.
 
-After that conversion, file-only linear evaluation needs no record of the
-original scale factors. Their effects are already in `Mmat`.
+File-only linear evaluation needs no record of the source scale factors after
+conversion. Their effects are in `Mmat`.
 
 ---
 
 ## 8. Parameter facts without duplication
 
-nltiming currently asks a live PINT model for several simple facts:
+nltiming needs several simple timing-solution facts:
 
 - exact parameter values;
 - units;
@@ -378,13 +366,13 @@ This unit is used for:
 Consumers may format values differently for presentation, but that is not a
 second scientific unit in the record.
 
-### 8.2 Why old fields disappear
+### 8.2 Why derived views are not stored
 
 `reference_theta_exact` duplicated `parameters[name].value` for fit parameters.
 `native_units` duplicated `parameters[name].units`.
 
-The record removes both. The linear engine derives the methods and attributes
-nltiming expects from `parameters`:
+The record does not store either view. The linear engine derives the methods
+and attributes nltiming expects from `parameters`:
 
 ```text
 reference_theta_exact() = fitpar values
@@ -459,7 +447,7 @@ Whether a timing package subtracts a mean from the residuals is different. It
 changes how the stored residual vector is presented, but it does not change a
 likelihood that marginalizes the required phase-offset column.
 
-The record still keeps this information because it helps explain differences
+The record keeps this information because it helps explain differences
 between timing packages and stored products. The name `ResidualCentering`
 states what the information is without introducing general “provenance” or
 gauge terminology into the user-facing API.
@@ -478,17 +466,15 @@ singular method that fails when several data sets are present.
 
 ---
 
-## 11. Row order and transitional comparison
+## 11. Row order and comparison
 
 The producer's row order is authoritative. psrdata never sorts.
 
-`TOARows(stoas, freqs, toaerrs)` remains a small ordered signature used by
-transitional code that compares two reads. It is not promoted into a permanent
-row-identity system.
+`TOARows(stoas, freqs, toaerrs)` is a small ordered signature for code that
+compares two reads. It is not a permanent row-identity system.
 
-Once each timing calculation emits its own record and engine together, that
-comparison is unnecessary for the pair because no second read has to be
-reconciled.
+A timing calculation that emits its record and engine together needs no such
+comparison because there is no second read to reconcile.
 
 ---
 
@@ -529,7 +515,7 @@ The array-column layout belongs to the established Enterprise-compatible
 format. psrdata cannot rename or reinterpret those columns without breaking
 readers that do not import psrdata.
 
-psrdata adds the metadata needed for its richer record:
+The metadata needed for the psrdata record consists of:
 
 - parameter facts;
 - timing-package mapping;
@@ -537,18 +523,14 @@ psrdata adds the metadata needed for its richer record:
 - residual-centering mapping;
 - the schema tag.
 
-Enterprise and Discovery ignore these additions.
+Enterprise and Discovery ignore these metadata keys.
 
-Additive metadata does not require a schema bump when an older reader can
-safely ignore it. The schema changes only when an existing array, unit, sign or
-shape would be misinterpreted.
+Additive metadata does not require a schema bump when readers for the schema
+can safely ignore it. A change to the meaning of an array, unit, sign or shape
+requires a new schema identifier.
 
-The field meanings in the current specification establish the stable v1
-contract. Earlier files created during development are not a compatibility
-constraint.
-
-Wideband timing changes the measurement representation and is intentionally
-deferred to a later design.
+Wideband timing changes the measurement representation and lies outside this
+contract.
 
 ---
 
@@ -558,8 +540,8 @@ A timing-engine protocol is a statement by nltiming about what nltiming needs.
 It therefore stays in nltiming.
 
 The psrdata linear engine directly implements that interface without importing
-its classes. When nltiming requires a new operation, psrdata supplies the
-linear answer. Consumer tests establish that the two remain aligned.
+its classes. Consumer tests enforce every required operation for which a
+linear answer exists.
 
 No additional compatibility version or intermediate capability layer is
 needed. All relevant packages are maintained together and tested against the
@@ -574,9 +556,9 @@ value per data set is returned as a mapping in both cases.
 ## 15. Why `partext` stays here
 
 The par-text helpers are not conceptually part of the timing-data record. They
-remain in psrdata for a practical reason: MetaPulsar and vela-jax require the
-same deterministic transformations and previously carried copies that
-diverged.
+belong in psrdata for a practical reason: MetaPulsar and vela-jax require the
+same deterministic transformations. One shared implementation keeps those
+transformations identical.
 
 They stay narrowly limited to transformations that do not instantiate a timing
 model or run timing software. Anything requiring a loaded model remains in the
@@ -584,9 +566,7 @@ producer.
 
 ---
 
-## 16. Resulting architecture
-
-After the migration:
+## 16. Architecture
 
 1. A producer selects a timing package for each data set.
 2. The par/tim files are interpreted under declared PINT or tempo2
@@ -599,9 +579,9 @@ After the migration:
    parameter space.
 7. psrdata serializes the record and supplies its exact linear calculation.
 8. nltiming consumes the constructed engine and applies inference policy.
-9. Enterprise and Discovery continue consuming the established array layout.
+9. Enterprise and Discovery consume the established array layout.
 
-The resulting contract has:
+The contract has:
 
 - no state fingerprint;
 - no deep immutability machinery;

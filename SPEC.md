@@ -4,11 +4,6 @@ This document defines the shared `psrdata` contract for MetaPulsar,
 vela-jax and nltiming. The companion
 [`SPEC-motivation.md`](SPEC-motivation.md) explains the design choices.
 
-The record and metadata changes specified here are the target of the current
-cross-package migration. The conformance table in §12 states what is already
-implemented and what still has to change. A package must not claim full
-conformance until its required rows are complete.
-
 Requirement identifiers (`R-n.m`) are stable handles for tests and reviews.
 “Must” states a requirement. “May” states an allowed choice. Each requirement
 also says whether psrdata can enforce it directly or whether its producer must
@@ -33,7 +28,7 @@ guarantee it.
 | **PINT unit** | the default unit assigned to that parameter by PINT; all record parameter values, uncertainties, deltas and design-matrix columns use these units |
 | **fitter sign** | `Δr ≈ -Mmat @ δ` |
 | **linear engine** | the record's callable linear timing calculation, `Δr = -Mmat @ δ` |
-| **schema** | the versioned Feather representation, currently `pulsardata-feather-v1` |
+| **schema** | the versioned Feather representation, `pulsardata-feather-v1` |
 
 ---
 
@@ -80,8 +75,8 @@ NumPy and PyArrow. Importing `psrdata` must not import PINT, tempo2/libstempo,
 JAX, Astropy, SciPy, Enterprise, Discovery, MetaPulsar or nltiming.
 
 **R-2.2 (dependency direction).** MetaPulsar, vela-jax and nltiming may depend
-on psrdata. psrdata must not import them. Enterprise and Discovery continue to
-read the Feather layout through their own readers.
+on psrdata. psrdata must not import them. Enterprise and Discovery read the
+Feather layout through their own readers.
 
 **R-2.3 (consumer-defined engine interface).** nltiming defines the engine
 interface. The psrdata linear engine must implement every required operation
@@ -321,8 +316,8 @@ residual_centering={"single": ResidualCentering(...)}
 ask its caller for a data-set name. It supplies the three scalar values above,
 and psrdata uses `"single"`.
 
-MetaPulsar already receives names as the keys of its input dictionaries
-(`"EPTA_DR2"`, `"PPTA_DR3"`, and so on). It uses those existing names as the
+MetaPulsar receives names as the keys of its input dictionaries
+(`"EPTA_DR2"`, `"PPTA_DR3"`, and so on). It uses those names as the
 keys of all three mappings when constructing a combined record. If MetaPulsar
 is given a standalone record, it replaces the internal `"single"` key in the
 new combined record with MetaPulsar's own input key.
@@ -379,7 +374,7 @@ stored value. The combiner applies all name, scale and reference conversions
 before inserting the blocks.
 
 A data-set-specific fit parameter may be suffixed by its data-set key. Its
-column still uses the parameter's PINT default unit.
+column uses the parameter's PINT default unit.
 
 ### 3.6 Phase-offset columns
 
@@ -436,15 +431,13 @@ parameter.
 needed by Enterprise and Discovery selections. Those flags are selection
 metadata, not the authoritative row partition.
 
-### 3.8 Transitional row comparison
+### 3.8 Row comparison
 
 **R-3.8.1 (`TOARows`).** `record.toa_rows()` returns
 `TOARows(stoas, freqs, toaerrs)`. It is an ordered alignment signature for
-transitional code that compares two reads of the same data. It is not a
-persistent identifier and is not required to be unique.
-
-Once one calculation produces both record and engine, that path needs no
-second-read alignment check.
+code that compares two reads of the same data. It is not a persistent
+identifier and is not required to be unique. A record–engine pair produced by
+one calculation requires no second-read alignment check.
 
 ---
 
@@ -510,8 +503,8 @@ They return the complete linear calculation over the record's matrix.
 **R-5.2.1.** `fitpars` is the record's fitpar tuple.
 
 **R-5.2.2.** `native_units` is a mapping from each fit parameter to its PINT
-unit, keyed in fitpar order. The attribute keeps nltiming's established
-name; its contents are always PINT units.
+unit, keyed in fitpar order. The attribute implements nltiming's
+`native_units` interface; its contents are always PINT units.
 
 **R-5.2.3.** `reference_theta_exact()` is a mapping from each fit parameter
 to its decimal `ParameterFact.value` string, keyed in fitpar order. This is
@@ -574,7 +567,7 @@ psrdata implements the linear answer and its consumer test is updated.
 
 ### 6.1 Columns
 
-The table columns remain Enterprise-compatible:
+The table columns are Enterprise-compatible:
 
 - scalar columns: `toas`, `stoas`, `toaerrs`, `residuals`, `freqs`,
   `backend_flags`, `telescope`;
@@ -642,18 +635,15 @@ files without importing psrdata or understanding its additive metadata.
 
 ### 6.4 Versioning
 
-**R-6.4.1.** Additive metadata does not change the schema when older readers
-can safely ignore it. Functionality requiring an optional key checks for that
-key explicitly.
+**R-6.4.1.** Additive metadata does not change the schema when readers for the
+schema can safely ignore it. Functionality requiring an optional key checks
+for that key explicitly.
 
-**R-6.4.2.** The schema changes when an older reader would misinterpret an
-existing array, field, unit, sign or shape.
+**R-6.4.2.** A change to the meaning of an array, field, unit, sign or shape
+requires a new schema identifier.
 
 **R-6.4.3.** A reader refuses an unknown schema. No forward-compatibility
 guessing is allowed.
-
-Files written before this contract was finalized are development artifacts;
-the stable v1 contract begins with the field meanings in this document.
 
 ---
 
@@ -798,7 +788,7 @@ When it exposes a residual Jacobian, `record.Mmat = -J`.
 MetaPulsar selects timing software during construction. It may rename
 parameters, convert units and combine blocks once. It must not later replace
 the selected timing calculation with unrelated timing software while retaining
-the old record.
+the record.
 
 ---
 
@@ -816,30 +806,21 @@ psrdata does not:
 - promise correctness after callers mutate a record;
 - distinguish a combined record through a different class or protocol;
 - store a duplicate phase-reference direction;
-- define wideband timing in this version.
+- define wideband timing.
 
 ---
 
-## 12. Migration and conformance
+## 12. Conformance
 
-| change | psrdata | vela-jax | MetaPulsar | nltiming |
-|---|---|---|---|---|
-| remove `state_id` | implemented | planned | planned | stop requiring it |
-| remove record immutability requirement | specification complete | no producer change required | no producer change required | no consumer change required |
-| `timing_package` means calculating software, as a mapping | implemented | planned | planned | consume new meaning |
-| add `partim_compatibility` mapping | implemented | planned | planned (its current `timing_package` is this field) | consume if needed |
-| add `producer` (replaces `software`) | implemented | planned | planned | no consumer change required |
-| `toas` at PINT's barycentric cutoff on every read path | n/a | implemented (`reference_barycentric`) | verify the libstempo materializer | no consumer change required |
-| PINT units for every record parameter and matrix column | validation implemented | producer conversion required | combination conversion required | consume declared PINT units |
-| add `parameters` and remove duplicate record mappings | implemented | producer facts required | producer facts required | derive references/units from facts |
-| replace `GaugeProvenance` with `ResidualCentering` mapping | implemented | planned | planned | consume mapping |
-| linear engine supports one or several data sets identically | implemented | n/a | n/a | consumer tests implemented |
-| one record–engine calculation per data set | n/a | implemented | vela-jax implemented; remaining timing packages planned | receive constructed engine |
-| wideband | deferred | deferred | deferred | deferred |
+A conforming psrdata implementation satisfies the requirements assigned to
+psrdata in this document. A conforming producer additionally satisfies §9 and
+tests the scientific guarantees that psrdata cannot observe. A conforming
+record–engine pair satisfies §10. A conforming consumer interprets the record
+fields, units and schema as specified here.
 
-Engine selection moves entirely into MetaPulsar construction. nltiming receives
-the constructed timing engine and does not choose PINT, tempo2, JUG, Vela.jl
-or vela-jax.
+Engine selection belongs to producer construction. nltiming receives the
+constructed timing engine and does not choose PINT, tempo2, JUG, Vela.jl or
+vela-jax.
 
 ---
 
