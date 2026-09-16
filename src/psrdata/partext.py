@@ -15,6 +15,7 @@ only copy.
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Iterator
 
 from .errors import ParTextError
@@ -145,6 +146,7 @@ def effective_units(text: str) -> str:
 # --- keyword respellings ---------------------------------------------------
 
 _FDJUMP_TEMPO2 = re.compile(r"^(\s*)FDJUMP(\d+)(?=\s|$)", re.I)
+_CLOCK_PINT = re.compile(r"^(\s*)CLOCK(?=\s|$)", re.I)
 
 
 def respell_fdjump_for_pint(text: str) -> str:
@@ -173,11 +175,7 @@ def respell_clock_for_tempo2(text: str) -> str:
     """
     out = []
     for line in text.splitlines():
-        tokens = line.split()
-        if tokens and tokens[0].upper() == "CLOCK":
-            out.append(" ".join(["CLK"] + tokens[1:]))
-        else:
-            out.append(line)
+        out.append(_CLOCK_PINT.sub(r"\1CLK", line))
     return "\n".join(out) + "\n"
 
 
@@ -200,8 +198,8 @@ def _same_value(first: str | None, second: str | None) -> bool:
     if first is None or second is None:
         return False
     try:
-        return float(first) == float(second)
-    except ValueError:
+        return Decimal(first) == Decimal(second)
+    except (InvalidOperation, ValueError):
         return False
 
 

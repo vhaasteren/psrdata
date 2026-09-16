@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,7 @@ name = "psrdata"
 description = "The frozen pulsar-data record, its feather schema, and the pure par-text rules"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Rutger van Haasteren" }]
 dynamic = ["version"]
 
@@ -16,6 +16,10 @@ dynamic = ["version"]
 # array record that required a timing engine to read would defeat its purpose.
 # A test asserts the import graph.
 dependencies = ["numpy>=1.24", "pyarrow>=12"]
+
+[project.urls]
+Repository = "https://github.com/vhaasteren/psrdata"
+Issues = "https://github.com/vhaasteren/psrdata/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "black", "ruff"]

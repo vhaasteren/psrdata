@@ -91,6 +91,21 @@ def test_duplicate_fitpars_refused():
         make_record(fitpars=fitpars, Mmat=Mmat)
 
 
+@pytest.mark.parametrize("field", ["setpars", "fitpars"])
+@pytest.mark.parametrize("bad_name", [7, "", None])
+def test_parameter_names_must_be_nonempty_strings(field, bad_name):
+    kwargs = record_kwargs()
+    names = list(kwargs[field])
+    names[0] = bad_name
+    updates = {field: tuple(names)}
+    if field == "fitpars":
+        parameters = dict(kwargs["parameters"])
+        parameters[bad_name] = parameters["F0"]
+        updates["parameters"] = parameters
+    with pytest.raises(RecordError, match=field):
+        make_record(**updates)
+
+
 def test_every_fitpar_must_be_a_setpar():
     with pytest.raises(RecordError, match="F0"):
         make_record(setpars=tuple(p for p in SINGLE_SETPARS if p != "F0"))
@@ -182,6 +197,24 @@ def test_a_fit_parameter_needs_a_unit_and_a_decimal_value():
         make_record(parameters=parameters)
     parameters["F0"] = ParameterFact("three hundred", "Hz")
     with pytest.raises(RecordError, match="F0"):
+        make_record(parameters=parameters)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "not-a-number"])
+def test_every_numerical_parameter_value_must_be_a_finite_decimal(value):
+    kwargs = record_kwargs()
+    parameters = dict(kwargs["parameters"])
+    parameters["PB"] = ParameterFact(value, "d")
+    with pytest.raises(RecordError, match="PB"):
+        make_record(parameters=parameters)
+
+
+@pytest.mark.parametrize("uncertainty", ["NaN", "Infinity", "not-a-number"])
+def test_every_parameter_uncertainty_must_be_a_finite_decimal(uncertainty):
+    kwargs = record_kwargs()
+    parameters = dict(kwargs["parameters"])
+    parameters["PB"] = ParameterFact("1.53", "d", uncertainty)
+    with pytest.raises(RecordError, match="PB"):
         make_record(parameters=parameters)
 
 
@@ -391,6 +424,21 @@ def test_dmx_none_or_a_nonempty_table():
         make_record(dmx={})
     with pytest.raises(RecordError, match="dmx"):
         make_record(dmx={"DMX_0001": {"DMX": 1e-3}})
+
+
+@pytest.mark.parametrize("field", ["DMX", "DMXerr", "DMXR1", "DMXR2"])
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, True])
+def test_dmx_numbers_must_be_finite_floats(field, bad):
+    entry = {
+        "DMX": 1e-3,
+        "DMXerr": None,
+        "DMXR1": 55000.0,
+        "DMXR2": 55010.0,
+        "fit": True,
+    }
+    entry[field] = bad
+    with pytest.raises(RecordError, match=field):
+        make_record(dmx={"DMX_0001": entry})
 
 
 def test_pdist_is_a_pair(record):

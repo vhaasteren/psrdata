@@ -824,16 +824,16 @@ psrdata does not:
 
 | change | psrdata | vela-jax | MetaPulsar | nltiming |
 |---|---|---|---|---|
-| remove `state_id` | planned | planned | planned | stop requiring it |
+| remove `state_id` | implemented | planned | planned | stop requiring it |
 | remove record immutability requirement | specification complete | no producer change required | no producer change required | no consumer change required |
-| `timing_package` means calculating software, as a mapping | planned | planned | planned | consume new meaning |
-| add `partim_compatibility` mapping | planned | planned | planned (its current `timing_package` is this field) | consume if needed |
-| add `producer` (replaces `software`) | planned | planned | planned | no consumer change required |
+| `timing_package` means calculating software, as a mapping | implemented | planned | planned | consume new meaning |
+| add `partim_compatibility` mapping | implemented | planned | planned (its current `timing_package` is this field) | consume if needed |
+| add `producer` (replaces `software`) | implemented | planned | planned | no consumer change required |
 | `toas` at PINT's barycentric cutoff on every read path | n/a | implemented (`reference_barycentric`) | verify the libstempo materializer | no consumer change required |
-| PINT units for every record parameter and matrix column | validation planned | producer conversion required | combination conversion required | consume declared PINT units |
-| add `parameters` and remove duplicate record mappings | planned | producer facts required | producer facts required | derive references/units from facts |
-| replace `GaugeProvenance` with `ResidualCentering` mapping | planned | planned | planned | consume mapping |
-| linear engine supports one or several data sets identically | partial | n/a | n/a | consumer tests required |
+| PINT units for every record parameter and matrix column | validation implemented | producer conversion required | combination conversion required | consume declared PINT units |
+| add `parameters` and remove duplicate record mappings | implemented | producer facts required | producer facts required | derive references/units from facts |
+| replace `GaugeProvenance` with `ResidualCentering` mapping | implemented | planned | planned | consume mapping |
+| linear engine supports one or several data sets identically | implemented | n/a | n/a | consumer tests implemented |
 | one record–engine calculation per data set | n/a | implemented | vela-jax implemented; remaining timing packages planned | receive constructed engine |
 | wideband | deferred | deferred | deferred | deferred |
 

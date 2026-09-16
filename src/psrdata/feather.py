@@ -147,7 +147,7 @@ def write(record: PulsarData, path, noisedict: Mapping[str, Any] | None = None) 
 
     meta = _metadata(record, noisedict)
     try:
-        text = json.dumps(meta, default=_json_default)
+        text = json.dumps(meta, default=_json_default, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise SchemaError(
             f"record metadata is not JSON serializable (check extra/dmx): {exc}"
@@ -194,6 +194,15 @@ def _require(meta: Mapping[str, Any], key: str, where: str) -> Any:
     if key not in meta:
         raise SchemaError(f"{where}: required metadata key {key!r} is missing")
     return meta[key]
+
+
+def _string_tuple(meta: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
+    value = _require(meta, key, where)
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise SchemaError(f"{where}: {key!r} must be a JSON array of nonempty strings")
+    return tuple(value)
 
 
 def _str_or_none(value, what: str, where: str) -> str | None:
@@ -353,8 +362,8 @@ def read(path) -> PulsarData:
 
     return PulsarData(
         name=meta["name"],
-        setpars=tuple(meta["setpars"]),
-        fitpars=tuple(meta["fitpars"]),
+        setpars=_string_tuple(meta, "setpars", where),
+        fitpars=_string_tuple(meta, "fitpars", where),
         parameters=_parameters(meta, where),
         flags=flags,
         pos=np.asarray(meta["pos"], dtype=np.float64),

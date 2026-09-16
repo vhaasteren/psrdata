@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -11,8 +14,8 @@ jobs:
         python-version: ["3.10", "3.12"]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e '.[dev]'
@@ -27,12 +30,25 @@ jobs:
     # the stock readers of the two packages that consume them, with no adapter.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      # enterprise's scikit-sparse dependency builds against CHOLMOD.
+      - run: sudo apt-get update && sudo apt-get install -y libsuitesparse-dev
       - run: pip install -e '.[dev]'
       - run: |
           pip install 'enterprise-pulsar @ git+https://github.com/nanograv/enterprise'
           pip install 'python-discovery @ git+https://github.com/nanograv/discovery'
       - run: pytest -q -m consumers
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*

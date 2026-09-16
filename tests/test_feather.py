@@ -342,6 +342,25 @@ def test_malformed_parameter_entries_are_refused(record, tmp_path):
         feather.read(path)
 
 
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("setpars", 5),
+        ("fitpars", "F0"),
+        ("setpars", ["F0", 7]),
+        ("fitpars", [""]),
+    ],
+)
+def test_malformed_parameter_name_lists_are_schema_errors(record, tmp_path, key, bad):
+    path = tmp_path / "badnames.feather"
+    feather.write(record, path)
+    meta = _meta(path)
+    meta[key] = bad
+    _rewrite(path, meta=meta)
+    with pytest.raises(SchemaError, match=key):
+        feather.read(path)
+
+
 def test_invalid_centering_at_read_is_a_record_error(record, tmp_path):
     """R-4.1.1: refused at Feather read as a ``RecordError``."""
     path = tmp_path / "badrc.feather"
@@ -402,6 +421,13 @@ def test_the_single_key_is_read_back_not_rederived(record, tmp_path):
 
 def test_nonserializable_extra_is_a_schema_error(record, tmp_path):
     rec = make_record(extra={"obj": object()})
+    with pytest.raises(SchemaError, match="extra"):
+        feather.write(rec, tmp_path / "x.feather")
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_nonfinite_json_metadata_is_a_schema_error(tmp_path, bad):
+    rec = make_record(extra={"bad": bad})
     with pytest.raises(SchemaError, match="extra"):
         feather.write(rec, tmp_path / "x.feather")
 

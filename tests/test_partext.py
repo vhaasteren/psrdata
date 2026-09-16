@@ -128,9 +128,14 @@ def test_fdjump_is_respelled_for_pint():
 def test_clock_is_respelled_for_tempo2():
     """tempo2's ``readParfile.C`` knows only ``CLK``; PINT writes ``CLOCK``."""
     assert respell_clock_for_tempo2("CLOCK  TT(BIPM2023)\nF0 1.0\n") == (
-        "CLK TT(BIPM2023)\nF0 1.0\n"
+        "CLK  TT(BIPM2023)\nF0 1.0\n"
     )
     assert respell_clock_for_tempo2("CLKCORR 1\n") == "CLKCORR 1\n"
+
+
+def test_clock_respelling_changes_only_the_first_token():
+    text = "  CLOCK\tTT(BIPM2023)   # keep spacing\n"
+    assert respell_clock_for_tempo2(text) == ("  CLK\tTT(BIPM2023)   # keep spacing\n")
 
 
 def test_a_doubled_line_is_collapsed():
@@ -143,6 +148,22 @@ def test_a_doubled_line_with_different_values_is_refused():
     """Keeping one of them silently would change the model."""
     with pytest.raises(ParTextError, match="twice with different values"):
         dedupe_nonrepeatable("NE_SW 4.0\nNE_SW 8.0\n")
+
+
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        ("339.315687288152030000", "339.315687288152030001"),
+        ("1e-400", "2e-400"),
+    ],
+)
+def test_distinct_high_precision_values_are_not_deduplicated(first, second):
+    with pytest.raises(ParTextError, match="twice with different values"):
+        dedupe_nonrepeatable(f"F0 {first}\nF0 {second}\n")
+
+
+def test_equivalent_decimal_spellings_are_deduplicated():
+    assert dedupe_nonrepeatable("NE_SW 4.0\nNE_SW 4.00\n") == "NE_SW 4.0\n"
 
 
 @pytest.mark.parametrize(

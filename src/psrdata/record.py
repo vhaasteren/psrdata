@@ -128,12 +128,11 @@ def _check_shape(name: str, arr: np.ndarray, shape: tuple[int, ...]) -> None:
         raise RecordError(f"{name} must have shape {shape}, got {arr.shape}")
 
 
-def _is_decimal(text: str) -> bool:
+def _is_finite_decimal(text: str) -> bool:
     try:
-        Decimal(text)
+        return Decimal(text).is_finite()
     except (InvalidOperation, ValueError, TypeError):
         return False
-    return True
 
 
 def _is_decimal_zero(text: str) -> bool:
@@ -217,6 +216,13 @@ class PulsarData:
 
         set_(self, "setpars", tuple(self.setpars))
         set_(self, "fitpars", tuple(self.fitpars))
+        for field_name in ("setpars", "fitpars"):
+            names = getattr(self, field_name)
+            bad = [name for name in names if not isinstance(name, str) or not name]
+            if bad:
+                raise RecordError(
+                    f"{field_name} must contain nonempty strings, got {bad!r}"
+                )
         p = len(self.fitpars)
         set_(self, "Mmat", _as_float_array("Mmat", self.Mmat))
         _check_shape("Mmat", self.Mmat, (n, p))
@@ -310,21 +316,24 @@ class PulsarData:
                 raise RecordError(
                     f"parameters[{name!r}].uncertainty must be str or None"
                 )
+            if fact.units is not None and not _is_finite_decimal(fact.value):
+                raise RecordError(
+                    f"numerical parameter {name!r} has a non-finite or "
+                    f"non-decimal value {fact.value!r}"
+                )
+            if fact.uncertainty is not None and not _is_finite_decimal(
+                fact.uncertainty
+            ):
+                raise RecordError(
+                    f"parameter {name!r} has a non-finite or non-decimal "
+                    f"uncertainty {fact.uncertainty!r}"
+                )
         # A fit parameter is a matrix column, so it is numerical with a unit
         # (R-3.3.2).
         for name in self.fitpars:
             fact = self.parameters[name]
             if fact.units is None:
                 raise RecordError(f"fit parameter {name!r} has no unit")
-            if not _is_decimal(fact.value):
-                raise RecordError(
-                    f"fit parameter {name!r} has a non-decimal value {fact.value!r}"
-                )
-            if fact.uncertainty is not None and not _is_decimal(fact.uncertainty):
-                raise RecordError(
-                    f"fit parameter {name!r} has a non-decimal uncertainty "
-                    f"{fact.uncertainty!r}"
-                )
             match = PHASE_OFFSET_RE.match(name)
             if match is None:
                 continue
@@ -360,10 +369,24 @@ class PulsarData:
             if missing:
                 raise RecordError(f"dmx entry {name!r} lacks {missing}")
             for k in ("DMX", "DMXR1", "DMXR2"):
-                if not isinstance(entry[k], Real):
-                    raise RecordError(f"dmx entry {name!r}[{k!r}] must be a float")
-            if entry["DMXerr"] is not None and not isinstance(entry["DMXerr"], Real):
-                raise RecordError(f"dmx entry {name!r}['DMXerr'] must be float or None")
+                value = entry[k]
+                if (
+                    not isinstance(value, Real)
+                    or isinstance(value, bool)
+                    or not np.isfinite(value)
+                ):
+                    raise RecordError(
+                        f"dmx entry {name!r}[{k!r}] must be a finite float"
+                    )
+            dmxerr = entry["DMXerr"]
+            if dmxerr is not None and (
+                not isinstance(dmxerr, Real)
+                or isinstance(dmxerr, bool)
+                or not np.isfinite(dmxerr)
+            ):
+                raise RecordError(
+                    f"dmx entry {name!r}['DMXerr'] must be a finite float or None"
+                )
             if not isinstance(entry["fit"], bool):
                 raise RecordError(f"dmx entry {name!r}['fit'] must be a bool")
 
